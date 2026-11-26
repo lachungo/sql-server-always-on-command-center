@@ -10,8 +10,17 @@ on:
 
 jobs:
   integration:
-    runs-on: ubuntu-latest
+    # Every combination runs in parallel on its own fresh machine
+    name: ${{ matrix.os }} / SQL Server ${{ matrix.sql }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    strategy:
+      fail-fast: false              # let every combination finish, so the results can be compared
+      matrix:
+        os:  [ubuntu-24.04, ubuntu-22.04]
+        sql: ['2022-latest', '2025-latest']
+    env:
+      MSSQL_IMAGE_TAG: ${{ matrix.sql }}
 
     steps:
       - name: Check out
@@ -60,7 +69,7 @@ jobs:
               Write-Host "`n===== $c : Always On / endpoint / connection messages =====" -ForegroundColor Cyan
               docker logs $c 2>&1 |
                   Select-String -Pattern 'Always On|HADR|availability (group|replica)|endpoint|mirroring|5022|certificate|handshake|47106|3520\d|timeout|error' |
-                  Select-Object -Last 60 | ForEach-Object Line
+                  Select-Object -Last 40 | ForEach-Object { $l = $_.Line; if ($l.Length -gt 300) { $l.Substring(0, 300) + ' ...' } else { $l } }
           }
           Write-Host "`n===== Container resource use =====" -ForegroundColor Cyan
           docker stats --no-stream
@@ -71,5 +80,5 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pester-results
+          name: pester-results-${{ matrix.os }}-sql${{ matrix.sql }}
           path: testResults.xml

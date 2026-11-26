@@ -3,7 +3,7 @@
 name: aglab
 
 x-sql: &sql
-  image: mcr.microsoft.com/mssql/server:2022-latest
+  image: "mcr.microsoft.com/mssql/server:${MSSQL_IMAGE_TAG:-2022-latest}"   # CI tests several versions
   environment: &sqlenv
     ACCEPT_EULA: "Y"
     MSSQL_PID: "Developer"
