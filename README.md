@@ -22,7 +22,7 @@ live, alert on what matters, and turn incidents into evidence-backed RCAs.
 
 | Module | What it does | Status |
 |---|---|---|
-| **AG Sync** | Detects and fixes drift in logins and Agent jobs across replicas, safely, with a full audit trail | ✅ Complete, 22 integration tests |
+| **AG Sync** | Keeps logins, Agent jobs and new databases consistent across replicas, safely, with a full audit trail | ✅ Complete, 29 integration tests |
 | **Health collector & alerts** | Snapshots roles, sync state, send/redo queues and lag; alerts on state changes, RPO breaches and disconnects | 🔨 Next |
 | **Live dashboard** | Interactive AG topology with animated data flow, lag, health assessment and sync status | 🔨 Planned |
 | **RCA toolkit** | Builds incident timelines from AlwaysOn_health events, snapshots and sync history | 🔨 Planned |
@@ -42,6 +42,7 @@ every decision.
 |---|---|---|
 | **Logins** | SID, password hash, enabled state, default database, server roles, **server-level permissions** | Created or rebuilt with the **same SID and password hash**, so database users never orphan after failover |
 | **Agent jobs** | SHA-256 of every step and schedule, enabled state, owner, category | Copied from the primary, **only if step 1 checks `sys.fn_hadr_is_primary_replica`** |
+| **New databases** | User databases on the primary that are in no AG: recovery model, full-backup history, state | Added to the AG with **automatic seeding**, **only if ready** (FULL recovery and a full backup) |
 
 | Drift found | What AgSync does |
 |---|---|
@@ -49,6 +50,7 @@ every decision.
 | Different on a secondary | Rebuilds or alters it (a SID mismatch only if nothing on the target depends on it) |
 | Only on a secondary (possible drop) | **Alert only**. Never dropped automatically |
 | Job without a primary-replica guard | **Blocked** until the guard is added |
+| New database not ready to join | **Alert only**, with the exact fix. AgSync never changes a recovery model or takes a backup on its own |
 | Extra roles or permissions on a secondary | Reported, never revoked automatically |
 
 ## Design principles
@@ -62,7 +64,7 @@ every decision.
 
   | Account | Permissions | Used for |
   |---|---|---|
-  | `agsync_detect` | `VIEW SERVER STATE`, `VIEW ANY DEFINITION`, `SELECT` on msdb job tables | Scheduled drift detection |
+  | `agsync_detect` | `VIEW SERVER STATE`, `VIEW ANY DEFINITION`, `SELECT` on msdb job and backup-history tables | Scheduled drift detection |
   | `agsync_apply` | `sysadmin` (creating jobs owned by other logins requires it) | Apply runs only |
   | `agsync_control` | `SELECT, INSERT, UPDATE` on the `agsync` schema | Writing the audit trail |
 
@@ -91,7 +93,7 @@ Invoke-AgSync   @lab -SqlCredential $app -ControlCredential $ctlCred -Mode Apply
 
 ## Tests
 
-22 integration tests run against a **real Availability Group**, not mocks. Each scenario builds its own drift,
+29 integration tests run against a **real Availability Group**, not mocks. Each scenario builds its own drift,
 runs AgSync with the least-privilege accounts, asserts the outcome, and cleans up.
 
 On every push, [GitHub Actions](.github/workflows/ci.yml) builds the full 3-replica AG in Docker with throwaway
@@ -101,7 +103,7 @@ passwords and runs the suite. No secrets are stored in the repository.
 |---|---|
 | SQL Server 2025 on Ubuntu 22.04 and 24.04 runners | **Required** on every push |
 | SQL Server 2022 CU26 on GitHub-hosted runners | **Required** on every push |
-| SQL Server 2022 CU27 (latest), locally (Docker on Windows) | Passing: all 22 tests |
+| SQL Server 2022 CU27 (latest), locally (Docker on Windows) | Passing: all tests |
 | SQL Server 2022 CU27 (latest) on GitHub-hosted runners | **Known issue**, tracked as experimental (see below) |
 
 **Known issue, found and bisected by this CI.** On GitHub-hosted runners, the SQL Server 2022 **CU27** container image
@@ -135,7 +137,7 @@ tests/AgSync.Tests.ps1   Pester integration suite
 - [x] Logins: SID, hash, roles, server permissions
 - [x] Agent jobs: step and schedule hashing, role-aware gate
 - [x] Privilege separation, audit trail, one-command lab, CI
-- [ ] New databases joining the AG automatically
+- [x] New databases joining the AG automatically (only when ready)
 - [ ] Failover drills: sync follows the new primary
 - [ ] Scale test: 1,000 logins and 500 jobs, timed
 - [ ] Linked servers and credentials

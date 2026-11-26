@@ -93,6 +93,34 @@ WHERE ars.is_local = 1 AND ag.name = N'$AgName';
     $prim = @($roles | Where-Object Role -eq 'PRIMARY').Instance
     $secs = @($roles | Where-Object Role -eq 'SECONDARY' | ForEach-Object Instance)
 
+    function Remove-TestDatabase {
+        # Takes the database out of the AG (if it is in) and drops it on every replica
+        param([string] $Name)
+        Invoke-Admin $prim @"
+IF EXISTS (SELECT 1 FROM sys.availability_databases_cluster WHERE database_name = N'$Name')
+    ALTER AVAILABILITY GROUP [$AgName] REMOVE DATABASE [$Name];
+"@
+        foreach ($r in $Replica) {
+            $deadline = (Get-Date).AddSeconds(60)
+            while ((Get-Date) -lt $deadline) {
+                try {
+                    Invoke-Admin $r "IF DB_ID(N'$Name') IS NOT NULL DROP DATABASE [$Name];"
+                    break
+                } catch { Start-Sleep -Seconds 3 }   # a secondary may still be finishing the removal
+            }
+        }
+    }
+    function Get-AgReplicaCountFor {
+        # How many replicas report this database as synchronizing or synchronized (asked on the primary)
+        param([string] $Database)
+        (Invoke-Admin $prim @"
+SELECT COUNT(*) AS c
+FROM sys.dm_hadr_database_replica_states drs
+WHERE DB_NAME(drs.database_id) = N'$Database'
+  AND drs.synchronization_state_desc IN ('SYNCHRONIZED', 'SYNCHRONIZING');
+"@).c
+    }
+
     $guard = "IF ISNULL(sys.fn_hadr_is_primary_replica(N'$AgDatabase'), 0) <> 1 BEGIN PRINT 'Not primary for $AgDatabase - skipping.'; RETURN; END;`n"
     $pw    = 'Pt_Lab_2026!x'
 }
@@ -251,6 +279,64 @@ WHERE j.name = N'$job' AND h.step_id = 1 ORDER BY h.instance_id DESC;
     }
 }
 
+Describe 'Database sync' {
+
+    Context 'A new database on the primary, ready to join' {
+        BeforeAll {
+            $db = 'pt_newdb'
+            Remove-TestDatabase $db
+            Invoke-Admin $prim "CREATE DATABASE [$db];"
+            Invoke-Admin $prim @"
+ALTER DATABASE [$db] SET RECOVERY FULL;
+BACKUP DATABASE [$db] TO DISK = N'/var/opt/mssql/data/$db.bak' WITH INIT;
+"@
+        }
+        AfterAll { Remove-TestDatabase $db }
+
+        It 'is detected as not in the AG' {
+            $d = Get-AgSyncDrift @agApply -ObjectType Database | Where-Object ObjectName -eq $db
+            $d.DriftType | Should -Be 'NotInAg'
+        }
+        It 'is joined to the AG by Apply' {
+            $r = Invoke-AgSync @agApply -ObjectType Database -Mode Apply | Where-Object ObjectName -eq $db
+            $r.Action | Should -Be 'Applied'
+        }
+        It 'is seeded to every replica' {
+            $deadline = (Get-Date).AddSeconds(120)
+            do { Start-Sleep -Seconds 3; $n = Get-AgReplicaCountFor $db } until ($n -eq $Replica.Count -or (Get-Date) -gt $deadline)
+            $n | Should -Be $Replica.Count
+        }
+        It 'leaves no database drift behind' {
+            Get-AgSyncDrift @agApply -ObjectType Database | Where-Object ObjectName -eq $db | Should -BeNullOrEmpty
+        }
+    }
+
+    Context 'A new database that is not ready (SIMPLE recovery, no backup)' {
+        BeforeAll {
+            $db = 'pt_simpledb'
+            Remove-TestDatabase $db
+            Invoke-Admin $prim "CREATE DATABASE [$db];"
+            Invoke-Admin $prim "ALTER DATABASE [$db] SET RECOVERY SIMPLE;"
+        }
+        AfterAll { Remove-TestDatabase $db }
+
+        It 'is AlertOnly, with the exact fix in the note' {
+            $r = Invoke-AgSync @agApply -ObjectType Database -Mode Apply | Where-Object ObjectName -eq $db
+            $r.Action | Should -Be 'AlertOnly'
+            $r.Note   | Should -BeLike '*SET RECOVERY FULL*'
+            $r.Note   | Should -BeLike '*no full backup*'
+        }
+        It 'is left untouched: not in the AG, recovery model unchanged' {
+            $d = Invoke-Admin $prim @"
+SELECT recovery_model_desc AS m, CASE WHEN group_database_id IS NULL THEN 0 ELSE 1 END AS in_ag
+FROM sys.databases WHERE name = N'$db';
+"@
+            $d.m     | Should -Be 'SIMPLE'
+            $d.in_ag | Should -Be 0
+        }
+    }
+}
+
 Describe 'Privilege separation' {
     It 'refuses Apply with the detect account' {
         { Invoke-AgSync @agDetect -Mode Apply } | Should -Throw '*Apply refused*'
@@ -261,6 +347,9 @@ Describe 'Privilege separation' {
     }
     It 'can read Agent job drift with the detect account (msdb grants in place)' {
         { Get-AgSyncDrift @agDetect -ObjectType AgentJob } | Should -Not -Throw
+    }
+    It 'can read database readiness with the detect account (backup history grant in place)' {
+        { Get-AgSyncDrift @agDetect -ObjectType Database } | Should -Not -Throw
     }
 }
 

@@ -9,6 +9,8 @@
       - Creates and changes are synced from the current primary to every secondary.
       - Objects found only on a secondary (ExtraOnTarget = possible drop) are alert-only.
       - Agent jobs without a primary-replica guard in step 1 are never synced.
+      - New user databases are joined to the AG only when ready (FULL recovery + a full backup); the tool never
+        changes a recovery model or takes a backup on its own.
       - Every run and every decision is logged to the control database.
 
     Public functions
@@ -16,7 +18,7 @@
       Invoke-AgSync     - Detect (plan + log) or Apply (execute + log)
 
     Privilege separation
-      - Detect account: VIEW SERVER STATE, VIEW ANY DEFINITION, SELECT on msdb job tables.
+      - Detect account: VIEW SERVER STATE, VIEW ANY DEFINITION, SELECT on msdb job and backup history tables.
         Sees all drift except password hashes (reading a hash requires CONTROL SERVER) and says so.
       - Apply account: sysadmin (creating jobs owned by other logins requires it). Used only to apply.
 
@@ -83,6 +85,24 @@ SELECT j.name,
             THEN 1 ELSE 0 END AS role_aware
 FROM msdb.dbo.sysjobs j
 LEFT JOIN msdb.dbo.syscategories c ON c.category_id = j.category_id;
+"@
+
+$script:DatabaseQuery = @"
+SELECT d.name,
+       d.recovery_model_desc,
+       d.state_desc,
+       CASE WHEN EXISTS (SELECT 1 FROM msdb.dbo.backupset b
+                         WHERE b.database_name = d.name AND b.type = 'D'
+                           -- A backup of THIS database, not of a dropped namesake. msdb stores these times to the
+                           -- whole second while create_date keeps milliseconds, so allow one second either way.
+                           AND b.database_creation_date BETWEEN DATEADD(SECOND, -1, d.create_date)
+                                                            AND DATEADD(SECOND,  1, d.create_date))
+            THEN 1 ELSE 0 END AS has_full_backup
+FROM sys.databases d
+WHERE d.database_id > 4                -- user databases only
+  AND d.is_distributor = 0             -- not a replication distribution database
+  AND d.source_database_id IS NULL     -- not a database snapshot
+  AND d.group_database_id IS NULL;     -- not already in an availability group
 "@
 
 #endregion
@@ -374,6 +394,47 @@ function Get-AgSyncJobPlan {
 
 #endregion
 
+#region Databases -------------------------------------------------------------
+
+function Get-AgSyncDatabaseFinding {
+    # User databases on the primary that are in no availability group
+    param($Ctx)
+    $pattern = Get-AgSyncExclusion $Ctx 'Database'
+    $source  = Get-AgSyncInventory $Ctx $Ctx.Primary.Instance $script:DatabaseQuery $pattern
+    foreach ($name in $source.Keys) {
+        $s = $source[$name]
+        $backup = if ($s.has_full_backup) { 'yes' } else { 'no' }
+        New-AgSyncFinding 'Database' $name $Ctx.Primary.Name $Ctx.AgName 'NotInAg' @() `
+            "recovery=$($s.recovery_model_desc); full_backup=$backup; state=$($s.state_desc)" $s $null
+    }
+}
+
+function Get-AgSyncDatabasePlan {
+    # Joins a database only when it is ready. Never changes the recovery model or takes a backup on its own.
+    param($Ctx, $Finding)
+    $s = $Finding.SourceObject
+    $n = ConvertTo-AgSyncQuotedName $s.name
+    $plan = [pscustomobject]@{ Action = 'Pending'; Kind = $null; Text = $null; Note = $Finding.Detail; Instance = $null }
+
+    $blockers = @()
+    if ($s.state_desc -ne 'ONLINE')         { $blockers += "database is $($s.state_desc)" }
+    if ($s.recovery_model_desc -ne 'FULL')  { $blockers += "recovery model is $($s.recovery_model_desc) (fix: ALTER DATABASE $n SET RECOVERY FULL;)" }
+    if (-not $s.has_full_backup)            { $blockers += "no full backup since it was created (fix: BACKUP DATABASE $n TO DISK = ...;)" }
+    if ($blockers.Count) {
+        $plan.Action = 'AlertOnly'
+        $plan.Note   = "Not ready to join $($Ctx.AgName): " + ($blockers -join '; ')
+        return $plan
+    }
+
+    # Runs on the primary; automatic seeding then creates the database on every secondary
+    $plan.Kind     = 'Sql'
+    $plan.Instance = $Ctx.Primary.Instance
+    $plan.Text     = "ALTER AVAILABILITY GROUP $(ConvertTo-AgSyncQuotedName $Ctx.AgName) ADD DATABASE $n;"
+    $plan
+}
+
+#endregion
+
 #region Run logging and execution ---------------------------------------------
 
 function Start-AgSyncRun {
@@ -410,7 +471,9 @@ WHERE RunId = @run;
 
 function Invoke-AgSyncPlan {
     param($Ctx, $Finding, $Plan)
-    $target = $Ctx.ByName[$Finding.TargetReplica]
+    # A plan can name its own instance (e.g. adding a database runs on the primary); otherwise the target replica
+    $target = if ($Plan.PSObject.Properties['Instance'] -and $Plan.Instance) { $Plan.Instance }
+              else { $Ctx.ByName[$Finding.TargetReplica] }
     switch ($Plan.Kind) {
         'Sql' {
             Invoke-DbaQuery -SqlInstance $target -SqlCredential $Ctx.SqlCredential -Query $Plan.Text -EnableException
@@ -447,7 +510,7 @@ function Get-AgSyncDrift {
         [Parameter(Mandatory)] [string[]]     $Replica,
         [Parameter(Mandatory)] [string]       $AgName,
         [Parameter(Mandatory)] [pscredential] $SqlCredential,
-        [ValidateSet('Login', 'AgentJob')] [string[]] $ObjectType = @('Login', 'AgentJob'),
+        [ValidateSet('Login', 'AgentJob', 'Database')] [string[]] $ObjectType = @('Login', 'AgentJob', 'Database'),
         [string] $ControlInstance = 'localhost',
         [string] $ControlDatabase = 'AgSyncControl',
         [pscredential] $ControlCredential
@@ -455,6 +518,7 @@ function Get-AgSyncDrift {
     $ctx = New-AgSyncContext $Replica $AgName $SqlCredential $ControlInstance $ControlDatabase $ControlCredential
     if ('Login'    -in $ObjectType) { Get-AgSyncLoginFinding $ctx }
     if ('AgentJob' -in $ObjectType) { Get-AgSyncJobFinding   $ctx }
+    if ('Database' -in $ObjectType) { Get-AgSyncDatabaseFinding $ctx }
 }
 
 function Invoke-AgSync {
@@ -470,7 +534,7 @@ function Invoke-AgSync {
         [Parameter(Mandatory)] [string[]]     $Replica,
         [Parameter(Mandatory)] [string]       $AgName,
         [Parameter(Mandatory)] [pscredential] $SqlCredential,
-        [ValidateSet('Login', 'AgentJob')] [string[]] $ObjectType = @('Login', 'AgentJob'),
+        [ValidateSet('Login', 'AgentJob', 'Database')] [string[]] $ObjectType = @('Login', 'AgentJob', 'Database'),
         [ValidateSet('Detect', 'Apply')]   [string]   $Mode = 'Detect',
         [string] $ControlInstance = 'localhost',
         [string] $ControlDatabase = 'AgSyncControl',
@@ -491,6 +555,7 @@ function Invoke-AgSync {
         $findings = @()
         if ('Login'    -in $ObjectType) { $findings += @(Get-AgSyncLoginFinding $ctx) }
         if ('AgentJob' -in $ObjectType) { $findings += @(Get-AgSyncJobFinding   $ctx) }
+        if ('Database' -in $ObjectType) { $findings += @(Get-AgSyncDatabaseFinding $ctx) }
 
         $blockedJobs = @($findings | Where-Object { $_.ObjectType -eq 'AgentJob' -and $_.DriftType -eq 'NotRoleAware' } |
                          ForEach-Object ObjectName)
@@ -499,6 +564,7 @@ function Invoke-AgSync {
             $plan = switch ($f.ObjectType) {
                 'Login'    { Get-AgSyncLoginPlan $ctx $f }
                 'AgentJob' { Get-AgSyncJobPlan   $ctx $f $blockedJobs }
+                'Database' { Get-AgSyncDatabasePlan $ctx $f }
             }
 
             if ($Mode -eq 'Apply' -and $plan.Kind) {
