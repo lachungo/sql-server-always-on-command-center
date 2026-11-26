@@ -11,13 +11,24 @@
       - Agent jobs without a primary-replica guard in step 1 are never synced.
       - Every run and every decision is logged to the control database.
 
+    Public functions
+      Get-AgSyncDrift   - report drift, change nothing
+      Invoke-AgSync     - Detect (plan + log) or Apply (execute + log)
+
+    Privilege separation
+      - Detect account: VIEW SERVER STATE, VIEW ANY DEFINITION, SELECT on msdb job tables.
+        Sees all drift except password hashes (reading a hash requires CONTROL SERVER) and says so.
+      - Apply account: sysadmin (creating jobs owned by other logins requires it). Used only to apply.
+
     Author: Louis Achungo | SQL IT Tech Solutions
 #>
 
 #region Queries ---------------------------------------------------------------
 
 $script:RoleQuery = @"
-SELECT @@SERVERNAME AS replica_name, ars.role_desc
+SELECT @@SERVERNAME AS replica_name, ars.role_desc,
+       HAS_PERMS_BY_NAME(NULL, NULL, 'CONTROL SERVER') AS can_read_hash,   -- needed to read password hashes
+       IS_SRVROLEMEMBER('sysadmin')                    AS is_sysadmin      -- needed to apply (jobs owned by others)
 FROM sys.availability_groups ag
 JOIN sys.dm_hadr_availability_replica_states ars
   ON ars.group_id = ag.group_id AND ars.is_local = 1
@@ -32,7 +43,12 @@ SELECT sp.name, sp.type_desc, sp.is_disabled, sp.default_database_name,
        ISNULL((SELECT STRING_AGG(r.name, ',') WITHIN GROUP (ORDER BY r.name)
                FROM sys.server_role_members m
                JOIN sys.server_principals r ON r.principal_id = m.role_principal_id
-               WHERE m.member_principal_id = sp.principal_id), '') AS server_roles
+               WHERE m.member_principal_id = sp.principal_id), '') AS server_roles,
+       ISNULL((SELECT STRING_AGG(CONCAT(p.state_desc, ' ', p.permission_name), ',') WITHIN GROUP (ORDER BY p.permission_name)
+               FROM sys.server_permissions p
+               WHERE p.grantee_principal_id = sp.principal_id
+                 AND p.class = 100                        -- server-level permissions only
+                 AND p.permission_name <> 'CONNECT SQL'), '') AS server_permissions
 FROM sys.server_principals sp
 LEFT JOIN sys.sql_logins sl ON sl.principal_id = sp.principal_id
 WHERE sp.type IN ('S', 'U', 'G');
@@ -85,6 +101,17 @@ function ConvertTo-AgSyncQuotedName {
     '[' + $Name.Replace(']', ']]') + ']'
 }
 
+function ConvertTo-AgSyncPermissionSql {
+    # 'GRANT VIEW SERVER STATE' -> GRANT VIEW SERVER STATE TO [login];
+    param([string] $Permission, [string] $QuotedName)
+    $state, $perm = $Permission -split ' ', 2
+    switch ($state) {
+        'GRANT_WITH_GRANT_OPTION' { "GRANT $perm TO $QuotedName WITH GRANT OPTION;" }
+        'DENY'                    { "DENY $perm TO $QuotedName;" }
+        default                   { "GRANT $perm TO $QuotedName;" }
+    }
+}
+
 function New-AgSyncContext {
     # Resolves the current topology once per call: who is primary, who are secondaries,
     # and how replica names (@@SERVERNAME) map to connection strings.
@@ -95,7 +122,8 @@ function New-AgSyncContext {
         $row = Invoke-DbaQuery -SqlInstance $r -SqlCredential $SqlCredential -Query $script:RoleQuery `
                                -SqlParameter @{ ag = $AgName } -EnableException
         if (-not $row) { Write-Warning "$r is not a replica of AG '$AgName' - ignored."; continue }
-        [pscustomobject]@{ Instance = $r; Name = $row.replica_name; Role = $row.role_desc }
+        [pscustomobject]@{ Instance = $r; Name = $row.replica_name; Role = $row.role_desc
+                           CanReadHash = [bool]$row.can_read_hash; IsSysadmin = [bool]$row.is_sysadmin }
     }
 
     $primary = @($roles | Where-Object Role -eq 'PRIMARY')
@@ -112,13 +140,12 @@ function New-AgSyncContext {
         Primary         = $primary[0]
         Secondaries     = @($roles | Where-Object Role -eq 'SECONDARY')
         ByName          = $byName
+        # Privilege separation: what the account running this call is allowed to do, on every replica
+        CanReadHash     = -not @($roles | Where-Object { -not $_.CanReadHash }).Count
+        CanApply        = -not @($roles | Where-Object { -not $_.IsSysadmin }).Count
+        NoApplyOn       = @($roles | Where-Object { -not $_.IsSysadmin } | ForEach-Object Name)
     }
 }
-
-#endregion
-
-
-#region Shared building blocks ------------------------------------------------
 
 function Get-AgSyncExclusion {
     # SQL LIKE patterns from the control DB, converted to PowerShell -like wildcards
@@ -184,18 +211,23 @@ function Compare-AgSyncInventory {
 
 #endregion
 
-
 #region Logins ----------------------------------------------------------------
 
 function Get-AgSyncLoginFinding {
     param($Ctx)
     $pattern = Get-AgSyncExclusion $Ctx 'Login'
+    $props   = 'sid', 'password_hash', 'is_disabled', 'default_database_name', 'server_roles', 'server_permissions'
+    if (-not $Ctx.CanReadHash) {
+        # Say so instead of silently reporting "no password drift"
+        Write-Warning 'Password hash drift NOT checked: the account lacks CONTROL SERVER (detect account). Run with the apply account to check passwords.'
+        $props = $props | Where-Object { $_ -ne 'password_hash' }
+    }
     $source  = Get-AgSyncInventory $Ctx $Ctx.Primary.Instance $script:LoginQuery $pattern
     foreach ($sec in $Ctx.Secondaries) {
         $target = Get-AgSyncInventory $Ctx $sec.Instance $script:LoginQuery $pattern
         Compare-AgSyncInventory -ObjectType 'Login' -Source $source -Target $target `
             -SourceName $Ctx.Primary.Name -TargetName $sec.Name `
-            -CompareProperty 'sid', 'password_hash', 'is_disabled', 'default_database_name', 'server_roles' `
+            -CompareProperty $props `
             -MissingDetail { param($s) "type=$($s.type_desc); roles=$($s.server_roles)" }
     }
 }
@@ -218,6 +250,9 @@ function New-AgSyncLoginCreateSql {
     foreach ($role in ("$($s.server_roles)" -split ',' | Where-Object { $_ })) {
         $lines += "ALTER SERVER ROLE [$role] ADD MEMBER $n;"
     }
+    foreach ($perm in ("$($s.server_permissions)" -split ',' | Where-Object { $_ })) {
+        $lines += ConvertTo-AgSyncPermissionSql $perm $n
+    }
     if ($s.is_disabled) { $lines += "ALTER LOGIN $n DISABLE;" }
     $lines -join "`n"
 }
@@ -228,6 +263,14 @@ function Get-AgSyncLoginPlan {
     $plan = [pscustomobject]@{ Action = 'Pending'; Kind = $null; Text = $null; Note = $f.Detail }
 
     if ($f.DriftType -eq 'ExtraOnTarget') { $plan.Action = 'AlertOnly'; return $plan }
+
+    # Recreating a SQL login needs its password hash; the detect account cannot read it
+    $needsHash = $f.DriftType -eq 'Missing' -or 'sid' -in $f.Property
+    if ($needsHash -and $s.type_desc -eq 'SQL_LOGIN' -and -not $s.password_hash) {
+        $plan.Action = 'AlertOnly'
+        $plan.Note  += '; password hash not readable with this account - plan with the apply account'
+        return $plan
+    }
 
     if ($f.DriftType -eq 'Missing') {
         $plan.Kind = 'Sql'; $plan.Text = New-AgSyncLoginCreateSql $s
@@ -268,6 +311,15 @@ function Get-AgSyncLoginPlan {
         $extra = @($tgtRoles | Where-Object { $_ -notin $srcRoles })
         if ($extra.Count) { $plan.Note += "; extra roles on target left in place: $($extra -join ',')" }
     }
+    if ('server_permissions' -in $f.Property) {
+        $srcPerms = @("$($s.server_permissions)" -split ',' | Where-Object { $_ })
+        $tgtPerms = @("$($t.server_permissions)" -split ',' | Where-Object { $_ })
+        foreach ($perm in $srcPerms | Where-Object { $_ -notin $tgtPerms }) {
+            $lines += ConvertTo-AgSyncPermissionSql $perm $n
+        }
+        $extra = @($tgtPerms | Where-Object { $_ -notin $srcPerms })
+        if ($extra.Count) { $plan.Note += "; extra permissions on target left in place: $($extra -join ',')" }
+    }
 
     if ($lines.Count) { $plan.Kind = 'Sql'; $plan.Text = $lines -join "`n" }
     else              { $plan.Action = 'AlertOnly' }   # e.g. only extra roles on target: never removed automatically
@@ -275,7 +327,6 @@ function Get-AgSyncLoginPlan {
 }
 
 #endregion
-
 
 #region Agent jobs ------------------------------------------------------------
 
@@ -319,7 +370,6 @@ function Get-AgSyncJobPlan {
 
 #endregion
 
-
 #region Run logging and execution ---------------------------------------------
 
 function Start-AgSyncRun {
@@ -352,7 +402,6 @@ WHERE RunId = @run;
 }
 
 function Invoke-AgSyncPlan {
-    # The only function that changes a replica
     param($Ctx, $Finding, $Plan)
     $target = $Ctx.ByName[$Finding.TargetReplica]
     switch ($Plan.Kind) {
@@ -363,7 +412,7 @@ function Invoke-AgSyncPlan {
             $copy = Copy-DbaAgentJob -Source $Ctx.Primary.Instance -SourceSqlCredential $Ctx.SqlCredential `
                                      -Destination $target -DestinationSqlCredential $Ctx.SqlCredential `
                                      -Job $Finding.ObjectName -Force -EnableException
-                        # Copy-DbaAgentJob can return extra objects without a Status: judge only the migration results
+            # Copy-DbaAgentJob can return extra objects without a Status: judge only the migration results
             $status = @($copy | Where-Object { $_.Status })
             $failed = @($status | Where-Object Status -eq 'Failed')
             if ($failed.Count -or -not @($status | Where-Object Status -eq 'Successful').Count) {
@@ -375,8 +424,7 @@ function Invoke-AgSyncPlan {
 
 #endregion
 
-
-#region Public commands -------------------------------------------------------
+#region Public functions ------------------------------------------------------
 
 function Get-AgSyncDrift {
     <#
@@ -420,8 +468,14 @@ function Invoke-AgSync {
         [string] $ControlDatabase = 'AgSyncControl'
     )
 
-    $ctx     = New-AgSyncContext $Replica $AgName $SqlCredential $ControlInstance $ControlDatabase
-    $runId   = Start-AgSyncRun $ctx $Mode
+    $ctx   = New-AgSyncContext $Replica $AgName $SqlCredential $ControlInstance $ControlDatabase
+
+    # Fail fast, before anything is logged or changed
+    if ($Mode -eq 'Apply' -and -not $ctx.CanApply) {
+        throw "Apply refused: the account is not sysadmin on $($ctx.NoApplyOn -join ', '). Use the apply account, or run -Mode Detect."
+    }
+
+    $runId = Start-AgSyncRun $ctx $Mode
     $results = @()
 
     try {
