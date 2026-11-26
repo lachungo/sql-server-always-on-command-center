@@ -51,6 +51,21 @@ function Sql {
     Invoke-DbaQuery -SqlInstance $Instance -SqlCredential $SaCredential -Database $Database -Query $Query -EnableException
 }
 
+function Invoke-WithRetry {
+    # HA operations race on fast machines (e.g. a replica joins before the primary's endpoint can serve the
+    # AG configuration: error 47106). Retry with a pause instead of failing the whole build.
+    param([scriptblock] $Action, [string] $What, [int] $Attempts = 10, [int] $DelaySeconds = 10)
+    for ($i = 1; $i -le $Attempts; $i++) {
+        try { & $Action; return }
+        catch {
+            if ($i -eq $Attempts) { throw }
+            $msg = ($_.Exception.Message -split "`r?`n")[0]
+            Write-Host "    $What - attempt $i/$Attempts failed: $msg. Retrying in $DelaySeconds s." -ForegroundColor Yellow
+            Start-Sleep -Seconds $DelaySeconds
+        }
+    }
+}
+
 Import-Module dbatools
 Set-DbatoolsInsecureConnection -SessionOnly | Out-Null
 
@@ -143,11 +158,13 @@ ALTER AVAILABILITY GROUP [$AgName] GRANT CREATE ANY DATABASE;
 }
 foreach ($r in $replicas[1..2]) {
     if (-not (Sql $r "SELECT COUNT(*) AS c FROM sys.availability_groups WHERE name = N'$AgName';").c) {
-        Sql $r @"
-ALTER AVAILABILITY GROUP [$AgName] JOIN WITH (CLUSTER_TYPE = NONE);
-ALTER AVAILABILITY GROUP [$AgName] GRANT CREATE ANY DATABASE;
-"@
+        Invoke-WithRetry -What "Join $r to $AgName" -Action {
+            Sql $r "ALTER AVAILABILITY GROUP [$AgName] JOIN WITH (CLUSTER_TYPE = NONE);"
+        }
     }
+    # Only after a successful join: lets automatic seeding create the AG databases on this replica
+    Sql $r "ALTER AVAILABILITY GROUP [$AgName] GRANT CREATE ANY DATABASE;"
+    Write-Host "    $r joined"
 }
 
 # ------------------------------------------------------------------------------------------------
