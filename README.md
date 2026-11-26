@@ -4,8 +4,9 @@
 
 [![Integration tests](https://github.com/lachungo/sql-server-always-on-command-center/actions/workflows/ci.yml/badge.svg)](https://github.com/lachungo/sql-server-always-on-command-center/actions/workflows/ci.yml)
 
-> 🚧 **Active work in progress.** Module 1 (AG Sync) is complete and tested on every push against a real
-> 3-replica Availability Group. The live dashboard, alerting and RCA modules are being built on the same foundation.
+> 🚧 **Active work in progress.** AG Sync (Module 1) and the health collector and alert engine (Module 2) are
+> tested on every push against a real 3-replica Availability Group: 57 integration tests, including a failover drill
+> and a deliberately suspended secondary. The live dashboard and RCA modules are being built on the same foundation.
 
 ## Why
 
@@ -23,8 +24,8 @@ live, alert on what matters, and turn incidents into evidence-backed RCAs.
 | Module | What it does | Status |
 |---|---|---|
 | **AG Sync** | Keeps logins, Agent jobs and new databases consistent across replicas, safely, with a full audit trail | ✅ Complete, 36 integration tests incl. a failover drill |
-| **Health collector & alerts** | Snapshots roles, sync state, send/redo queues and lag; alerts on state changes, RPO breaches and disconnects | 🔨 Next |
-| **Live dashboard** | Interactive AG topology with animated data flow, lag, health assessment and sync status | 🔨 Planned |
+| **Health collector & alerts** | Snapshots every replica and database (sync state, send/redo queues, estimated data loss and recovery time); rules stored as data; alerts that open, escalate and resolve without flapping | ✅ Collector and alert engine, 21 integration tests. 🔨 Scheduling and notifications next |
+| **Live dashboard** | Interactive AG topology with animated data flow, lag, health assessment and sync status | 🔨 Next |
 | **RCA toolkit** | Builds incident timelines from AlwaysOn_health events, snapshots and sync history | 🔨 Planned |
 | **MCP tools** | Exposes the Command Center to AI agents: "is this AG healthy?", "what drifted?", "what happened at 2:14 AM?" | 🔨 Planned |
 
@@ -91,14 +92,95 @@ Invoke-AgSync   @lab -SqlCredential $app -ControlCredential $ctlCred -Mode Detec
 Invoke-AgSync   @lab -SqlCredential $app -ControlCredential $ctlCred -Mode Apply  | Format-Table # apply + log
 ```
 
-## Tests
+---
 
-36 integration tests run against a **real Availability Group**, not mocks. Each scenario builds its own drift,
-runs AgSync with the least-privilege accounts, asserts the outcome, and cleans up.
+# Module 2: Health collector and alerts
+
+The collector takes a **snapshot** of an Availability Group and stores it on the controller; the alert engine turns
+snapshots into alerts. Snapshots are the history the dashboard draws and the RCA toolkit reads.
+
+## What a snapshot holds
+
+| Level | Collected | Why it matters |
+|---|---|---|
+| **AG** | Primary replica, collection status, duration | A failed collection is itself an alert: no data is a finding |
+| **Replica** | Role, commit mode, connected state, synchronization health, **reachable from the collector**, last connect error | The primary's view and the collector's own connection test can disagree; both are kept |
+| **Database, per replica** | Sync state, suspended and why, log send queue and rate, redo queue and rate, last hardened LSN, last commit | The raw evidence for every alert |
+| **Derived** | **Estimated data loss** (seconds behind the primary's last commit: RPO) and **estimated recovery time** (redo queue ÷ redo rate: RTO) | What a failover would cost right now |
+
+## How it behaves when things go wrong
+
+- **Every replica is probed separately**, with a short connect timeout. A dead replica is recorded as unreachable;
+  it can't hang the run or silently disappear from the snapshot.
+- **No primary, or two primaries, fails the snapshot but keeps the evidence.** On `CLUSTER_TYPE = NONE` two replicas
+  reporting PRIMARY after a forced failover is split brain, and the snapshot says so.
+- **Suspension is read from the secondary itself.** The primary cannot see `SUSPEND_FROM_PARTNER`.
+- **A snapshot is written in one transaction**, so a reader never sees half of one.
+
+## Alert rules are data
+
+Eleven default rules ship in `aghealth.AlertRule`. Tuning one is an `UPDATE`, adding one is an `INSERT`; no redeploy,
+and re-running the schema script never overwrites a tuned threshold.
+
+| Rule | Fires when | Severity | In a row |
+|---|---|---|---|
+| CollectionFailed | The collector could not complete a snapshot | Critical | 2 |
+| ReplicaUnreachable | The collector cannot connect to a replica | Critical | 2 |
+| ReplicaDisconnected | The primary reports a replica disconnected | Critical | 2 |
+| ReplicaNotHealthy | Replica synchronization health is not HEALTHY | Warning | 2 |
+| DatabaseSuspended | Data movement is suspended (the primary's log will grow) | Critical | 1 |
+| SyncSecondaryNotSynced | A **synchronous** secondary is not SYNCHRONIZED | Critical | 2 |
+| AsyncSecondaryNotMoving | An **asynchronous** secondary is not SYNCHRONIZING | Warning | 2 |
+| LogSendQueueHigh | Log not yet sent > 100 MB / 1 GB | Warning / Critical | 3 |
+| RedoQueueHigh | Log not yet redone > 500 MB / 2 GB | Warning / Critical | 3 |
+| EstimatedDataLossHigh | An async secondary is > 60 s / 300 s behind (RPO) | Warning / Critical | 3 |
+| EstimatedRecoveryHigh | Redo would take > 300 s / 900 s (RTO) | Warning / Critical | 3 |
+
+Rules know the commit mode: "not SYNCHRONIZED" is an outage on a synchronous secondary and normal on an asynchronous one.
+
+## Alert lifecycle
+
+- **Opens** only after the rule breaches for its number of snapshots **in a row**: one bad reading doesn't page anyone.
+- **Stays open, once**, while the breach lasts. A unique index allows one open alert per rule and object, so there are
+  no duplicates and no re-alerting every minute.
+- **Escalates** from Warning to Critical, and queues a fresh notification when it does.
+- **Resolves only on a measured recovery.** An object the collector could not see this time is never "resolved".
+  Disabling a rule resolves its open alerts.
+- **Retention** purges old snapshots in batches, but never one an open alert still points at.
+
+## Least privilege
+
+| Account | Permissions | Used for |
+|---|---|---|
+| `agsync_detect` | On the replicas: `VIEW SERVER STATE`, `VIEW ANY DEFINITION` | Reading health: the collector never changes a replica |
+| `aghealth_writer` role (`agsync_control`) | On the controller: `SELECT, INSERT, UPDATE` on `aghealth`, `EXECUTE` on its procedures | Writing snapshots and alerts |
+| `aghealth_reader` role | On the controller: `SELECT` on `aghealth` | The dashboard |
+
+## Use it
+
+```powershell
+Import-Module ./AgHealth/AgHealth.psm1
+$s = Invoke-AgHealthCollection @lab -SqlCredential $det -ControlCredential $ctlCred
+$s.Databases | Format-Table ReplicaServerName, DatabaseName, SynchronizationState, LogSendQueueKb, RedoQueueKb, EstimatedDataLossSec, EstimatedRecoverySec
+$s.Alerts    | Format-Table Change, Severity, RuleName, ReplicaServerName, DatabaseName, LastValue
+```
+
+`$s.Alerts` lists every alert the snapshot touched: Opened, Escalated, Downgraded, Resolved or Ongoing.
+
+---
+
+# Tests (both modules)
+
+**57 integration tests** (36 for AG Sync, 21 for health and alerts) run against a **real Availability Group**, not mocks. Each scenario builds its own problem,
+runs the tools with the least-privilege accounts, asserts the outcome, and cleans up.
 
 The **failover drill** fails the AG over to a secondary and proves the point of the whole module: the application
 login connects to the new primary with its original password, the role-aware job does real work there and skips on
 the old primary, and AgSync follows the new primary with no configuration change. It then always fails back.
+
+The **suspended-secondary scenario** breaks the AG for real: it suspends data movement on the async secondary, then
+proves the alerts open (DatabaseSuspended on the first snapshot, AsyncSecondaryNotMoving only on the second in a row),
+hold without duplicates, and resolve once the replica catches up.
 
 On every push, [GitHub Actions](.github/workflows/ci.yml) builds the full 3-replica AG in Docker with throwaway
 passwords and runs the suite. No secrets are stored in the repository.
@@ -118,7 +200,7 @@ on an Intel desktop, which points to an interaction between that image and the r
 than to AgSync. The experimental job keeps tracking it on every push.
 
 ```powershell
-$c = New-PesterContainer -Path ./tests/AgSync.Tests.ps1 -Data @{
+$c = New-PesterContainer -Path ./tests/AgSync.Tests.ps1, ./tests/AgHealth.Tests.ps1 -Data @{
          Replica = $lab.Replica; AgName = $lab.AgName; ControlInstance = $lab.ControlInstance
          AdminCredential = $sa; ApplyCredential = $app; DetectCredential = $det; ControlCredential = $ctlCred }
 Invoke-Pester -Container $c -Output Detailed
@@ -127,17 +209,20 @@ Invoke-Pester -Container $c -Output Detailed
 ## Repository layout
 
 ```
-AgSync.psm1              the module: Get-AgSyncDrift, Invoke-AgSync
-sql/ControlDb.sql        control database schema (run on the controller)
+AgSync.psm1              Module 1: Get-AgSyncDrift, Invoke-AgSync
+AgHealth/AgHealth.psm1   Module 2: Invoke-AgHealthCollection
+sql/ControlDb.sql        control database and AG Sync audit schema (run on the controller)
+sql/HealthSchema.sql     health snapshots, alert rules, alert engine, retention (run on the controller)
 sql/AgSyncAccounts.sql   msdb permissions for the detect account (run on every replica)
 lab/New-AgLab.ps1        one-command lab: containers, certificates, endpoints, AG, seeding, accounts
 lab/docker-compose.yml   3 replicas + controller
 lab/Invoke-AgLabFailover.ps1  planned, lossless manual failover for a CLUSTER_TYPE = NONE AG
-tests/AgSync.Tests.ps1   Pester integration suite
-.github/workflows/ci.yml CI: build the AG, run the tests, on every push
+tests/AgSync.Tests.ps1   Pester integration suite, Module 1
+tests/AgHealth.Tests.ps1 Pester integration suite, Module 2
+.github/workflows/ci.yml CI: build the AG, run both suites, on every push
 ```
 
-## Roadmap (AG Sync and platform)
+## Roadmap
 
 - [x] Logins: SID, hash, roles, server permissions
 - [x] Agent jobs: step and schedule hashing, role-aware gate
@@ -146,7 +231,9 @@ tests/AgSync.Tests.ps1   Pester integration suite
 - [x] Failover drill: the synced logins and jobs work on the new primary, and sync follows it
 - [ ] Scale test: 1,000 logins and 500 jobs, timed
 - [ ] Linked servers and credentials
-- [ ] Health collector and alert engine
+- [x] Health collector: replicas, databases, queues, estimated data loss and recovery time
+- [x] Alert engine: rules as data, consecutive-breach opening, escalation, measured resolution, retention
+- [ ] Scheduled collection and notifications (email, Teams)
 - [ ] Live dashboard: topology, data flow, lag, alerts and sync status
 - [ ] RCA toolkit and MCP tools
 
