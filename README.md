@@ -99,9 +99,17 @@ passwords and runs the suite. No secrets are stored in the repository.
 
 | Platform | Status |
 |---|---|
-| SQL Server 2025 on Ubuntu 22.04 and 24.04 runners | Required: every push |
-| SQL Server 2022 locally (Docker on Windows) | Passing: all 22 tests |
-| SQL Server 2022 on GitHub-hosted runners | Experimental: the 2022 container spins at 100% CPU on incoming AG endpoint handshakes on these runners, so replicas never join. Under investigation; the same image passes locally. |
+| SQL Server 2025 on Ubuntu 22.04 and 24.04 runners | **Required** on every push |
+| SQL Server 2022 CU25 on GitHub-hosted runners | **Required** on every push |
+| SQL Server 2022 latest, locally (Docker on Windows) | Passing: all 22 tests |
+| SQL Server 2022 CU26 and later on GitHub-hosted runners | **Known issue**, tracked as experimental (see below) |
+
+**Known issue, found and bisected by this CI.** On GitHub-hosted runners, the latest SQL Server 2022 container image
+spins at 100% CPU when another replica connects to its AG endpoint, so the replica never joins (error 47106, then
+timeouts). A parallel run of every 2022 cumulative update showed **CU17 through CU25 pass** on the same runners, as
+does SQL Server 2025, so the change arrived with **CU26 or later**. The same latest image passes on an Intel desktop,
+which points to an interaction between the newer image and the runners' hardware or kernel rather than to AgSync.
+The experimental jobs keep tracking it on every push.
 
 ```powershell
 $c = New-PesterContainer -Path ./tests/AgSync.Tests.ps1 -Data @{

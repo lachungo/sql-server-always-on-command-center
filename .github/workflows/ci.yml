@@ -14,28 +14,22 @@ jobs:
     name: ${{ matrix.os }} / SQL Server ${{ matrix.sql }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15                # a passing job takes about 3 minutes
-    # Known issue: the SQL Server 2022 container spins at 100% CPU on incoming HADR endpoint handshakes on
-    # GitHub-hosted runners (the same image passes on Intel desktops). Those jobs run as "experimental":
-    # their result is visible in every run, but they don't turn the badge red while the issue is investigated.
+    # Known issue (bisected in CI): from SQL Server 2022 CU26/CU27 onwards, the 2022 container spins at 100% CPU on
+    # incoming HADR endpoint handshakes on GitHub-hosted runners, so replicas never join. CU17-CU25 and SQL Server 2025
+    # pass on the same runners, and 2022-latest passes on an Intel desktop. Experimental jobs stay visible in every run
+    # but don't turn the badge red.
     continue-on-error: ${{ matrix.experimental }}
     strategy:
       fail-fast: false              # let every combination finish, so the results can be compared
       matrix:
-        os:  [ubuntu-24.04, ubuntu-22.04]
-        sql: ['2025-latest']
-        experimental: [false]
         include:
+          # Required: these decide the badge
+          - { os: ubuntu-24.04, sql: '2025-latest',            experimental: false }
+          - { os: ubuntu-22.04, sql: '2025-latest',            experimental: false }
+          - { os: ubuntu-24.04, sql: '2022-CU25-ubuntu-22.04', experimental: false }   # last 2022 update known good on runners
+          # Experimental: tracks the known issue
           - { os: ubuntu-24.04, sql: '2022-latest',            experimental: true }
-          # Temporary bisect: CU16 passes and the latest 2022 image spins. Which update introduced it?
-          - { os: ubuntu-24.04, sql: '2022-CU17-ubuntu-22.04', experimental: true }
-          - { os: ubuntu-24.04, sql: '2022-CU18-ubuntu-22.04', experimental: true }
-          - { os: ubuntu-24.04, sql: '2022-CU19-ubuntu-22.04', experimental: true }
-          - { os: ubuntu-24.04, sql: '2022-CU20-ubuntu-22.04', experimental: true }
-          - { os: ubuntu-24.04, sql: '2022-CU21-ubuntu-22.04', experimental: true }
-          - { os: ubuntu-24.04, sql: '2022-CU22-ubuntu-22.04', experimental: true }
-          - { os: ubuntu-24.04, sql: '2022-CU23-ubuntu-22.04', experimental: true }
-          - { os: ubuntu-24.04, sql: '2022-CU24-ubuntu-22.04', experimental: true }
-          - { os: ubuntu-24.04, sql: '2022-CU25-ubuntu-22.04', experimental: true }
+          - { os: ubuntu-24.04, sql: '2022-CU26-ubuntu-22.04', experimental: true }   # narrows it to CU26 vs CU27
     env:
       MSSQL_IMAGE_TAG: ${{ matrix.sql }}
 
