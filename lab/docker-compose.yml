@@ -1,0 +1,40 @@
+name: aglab
+
+x-sql: &sql
+  image: mcr.microsoft.com/mssql/server:2022-latest
+  environment:
+    ACCEPT_EULA: "Y"
+    MSSQL_PID: "Developer"
+    MSSQL_SA_PASSWORD: "${SA_PASSWORD}"
+    MSSQL_AGENT_ENABLED: "true"
+    MSSQL_ENABLE_HADR: "1"
+  networks: [agnet]
+  restart: unless-stopped
+
+services:
+  agsql1:
+    <<: *sql
+    hostname: agsql1
+    container_name: agsql1
+    ports: ["14341:1433"]
+    volumes: ["agsql1data:/var/opt/mssql"]
+  agsql2:
+    <<: *sql
+    hostname: agsql2
+    container_name: agsql2
+    ports: ["14342:1433"]
+    volumes: ["agsql2data:/var/opt/mssql"]
+  agsql3:
+    <<: *sql
+    hostname: agsql3
+    container_name: agsql3
+    ports: ["14343:1433"]
+    volumes: ["agsql3data:/var/opt/mssql"]
+
+networks:
+  agnet:
+
+volumes:
+  agsql1data:
+  agsql2data:
+  agsql3data:
