@@ -52,9 +52,20 @@ jobs:
           $cfg.TestResult.OutputPath  = 'testResults.xml'
           Invoke-Pester -Configuration $cfg
 
-      - name: SQL Server logs (on failure)
+      - name: AG diagnostics (on failure)
         if: failure()
-        run: docker compose -p aglab logs --tail 200
+        shell: pwsh
+        run: |
+          foreach ($c in 'agsql1', 'agsql2', 'agsql3') {
+              Write-Host "`n===== $c : Always On / endpoint / connection messages =====" -ForegroundColor Cyan
+              docker logs $c 2>&1 |
+                  Select-String -Pattern 'Always On|HADR|availability (group|replica)|endpoint|mirroring|5022|certificate|handshake|47106|3520\d|timeout|error' |
+                  Select-Object -Last 60 | ForEach-Object Line
+          }
+          Write-Host "`n===== Container resource use =====" -ForegroundColor Cyan
+          docker stats --no-stream
+          Write-Host "`n===== Host =====" -ForegroundColor Cyan
+          nproc; free -m
 
       - name: Upload test results
         if: always()

@@ -10,6 +10,7 @@ x-sql: &sql
     MSSQL_SA_PASSWORD: "${SA_PASSWORD}"
     MSSQL_AGENT_ENABLED: "true"
     MSSQL_ENABLE_HADR: "1"
+    MSSQL_MEMORY_LIMIT_MB: "2048"       # four instances share one machine (a CI runner has 16 GB)
   networks: [agnet]
   restart: unless-stopped
 
@@ -43,6 +44,7 @@ services:
       <<: *sqlenv
       MSSQL_AGENT_ENABLED: "false"
       MSSQL_ENABLE_HADR: "0"
+      MSSQL_MEMORY_LIMIT_MB: "1024"
     ports: ["14340:1433"]
     volumes: ["agctldata:/var/opt/mssql"]
 

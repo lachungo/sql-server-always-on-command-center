@@ -47,8 +47,22 @@ $keyPw    = $saPw    # lab only: master keys, certificate transfer and endpoint 
 function Write-Step { param([string] $Message) Write-Host "==> $Message" -ForegroundColor Cyan }
 
 function Sql {
-    param([string] $Instance, [string] $Query, [string] $Database = 'master')
-    Invoke-DbaQuery -SqlInstance $Instance -SqlCredential $SaCredential -Database $Database -Query $Query -EnableException
+    param([string] $Instance, [string] $Query, [string] $Database = 'master', [int] $QueryTimeout = 120)
+    Invoke-DbaQuery -SqlInstance $Instance -SqlCredential $SaCredential -Database $Database -Query $Query `
+                    -QueryTimeout $QueryTimeout -EnableException
+}
+
+function Wait-Until {
+    # Polls a condition instead of guessing with sleeps; fails with a clear message on timeout
+    param([scriptblock] $Condition, [string] $What, [int] $TimeoutSeconds = 180, [int] $PollSeconds = 3)
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ($true) {
+        $ok = $false
+        try { $ok = [bool](& $Condition) } catch { $ok = $false }
+        if ($ok) { return }
+        if ((Get-Date) -gt $deadline) { throw "Timed out after $TimeoutSeconds s waiting for: $What" }
+        Start-Sleep -Seconds $PollSeconds
+    }
 }
 
 function Invoke-WithRetry {
@@ -90,6 +104,16 @@ foreach ($i in $replicas + $ctl) {
         }
     }
     Write-Host "    $i ready"
+}
+
+# Accepting logins is not the same as Always On being ready: the HADR manager starts after logins are
+# accepted, and on a small, busy machine the gap can be long. A JOIN sent into that gap hangs.
+Write-Step 'Waiting for Always On (HADR manager) to start on every replica'
+foreach ($r in $replicas) {
+    Wait-Until -What "HADR manager on $r" -Condition {
+        (Sql $r "SELECT CAST(SERVERPROPERTY('HadrManagerStatus') AS int) AS s;").s -eq 1
+    }
+    Write-Host "    $r HADR running"
 }
 
 # ------------------------------------------------------------------------------------------------
@@ -156,10 +180,21 @@ CREATE AVAILABILITY GROUP [$AgName] WITH (CLUSTER_TYPE = NONE)
 ALTER AVAILABILITY GROUP [$AgName] GRANT CREATE ANY DATABASE;
 "@
 }
+# The primary must be serving the AG before any secondary asks it for the configuration
+Wait-Until -What "$AgName online on the primary" -Condition {
+    (Sql $replicas[0] @"
+SELECT COUNT(*) AS c
+FROM sys.dm_hadr_availability_replica_states ars
+JOIN sys.availability_groups ag ON ag.group_id = ars.group_id
+WHERE ag.name = N'$AgName' AND ars.is_local = 1
+  AND ars.role_desc = 'PRIMARY' AND ars.operational_state_desc = 'ONLINE';
+"@).c -eq 1
+}
+
 foreach ($r in $replicas[1..2]) {
     if (-not (Sql $r "SELECT COUNT(*) AS c FROM sys.availability_groups WHERE name = N'$AgName';").c) {
-        Invoke-WithRetry -What "Join $r to $AgName" -Action {
-            Sql $r "ALTER AVAILABILITY GROUP [$AgName] JOIN WITH (CLUSTER_TYPE = NONE);"
+        Invoke-WithRetry -What "Join $r to $AgName" -Attempts 5 -DelaySeconds 15 -Action {
+            Sql $r "ALTER AVAILABILITY GROUP [$AgName] JOIN WITH (CLUSTER_TYPE = NONE);" -QueryTimeout 300
         }
     }
     # Only after a successful join: lets automatic seeding create the AG databases on this replica
