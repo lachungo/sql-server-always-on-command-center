@@ -1,4 +1,4 @@
-# Always On Command Center CI: on every push, build a real 3-replica Always On AG in Docker and run the integration suite.
+# Always On Command Center CI: on every push, build a real 3-replica Always On AG in Docker and run the integration suites.
 # No secrets needed: every run generates throwaway passwords for a lab that exists only for that run.
 name: Integration tests
 
@@ -62,7 +62,8 @@ jobs:
 
           $lab = ./lab/New-AgLab.ps1 -SaCredential $sa -ApplyCredential $app -DetectCredential $det -ControlCredential $ctlCred -Reset
 
-          $container = New-PesterContainer -Path ./tests/AgSync.Tests.ps1 -Data @{
+          # One lab, both suites: AG Sync (Module 1), then health and alerts (Module 2)
+          $container = New-PesterContainer -Path ./tests/AgSync.Tests.ps1, ./tests/AgHealth.Tests.ps1 -Data @{
               Replica = $lab.Replica; AgName = $lab.AgName; ControlInstance = $lab.ControlInstance
               AdminCredential = $sa; ApplyCredential = $app; DetectCredential = $det; ControlCredential = $ctlCred }
 

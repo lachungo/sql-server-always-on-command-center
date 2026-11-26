@@ -240,6 +240,12 @@ IF USER_ID(N'$cu') IS NULL CREATE USER [$cu] FOR LOGIN [$cu];
 GRANT SELECT, INSERT, UPDATE ON SCHEMA::agsync TO [$cu];
 "@
 
+# Health schema (Module 2): snapshots, alert rules, alerts. The control login is its writer.
+Invoke-DbaQuery -SqlInstance $ctl -SqlCredential $SaCredential -File (Join-Path $root 'sql/HealthSchema.sql') -EnableException
+Sql $ctl -Database AgSyncControl -Query @"
+IF IS_ROLEMEMBER('aghealth_writer', N'$cu') = 0 ALTER ROLE aghealth_writer ADD MEMBER [$cu];
+"@
+
 # ------------------------------------------------------------------------------------------------
 Write-Step 'AgSync service accounts (created on the primary, distributed by AgSync itself)'
 $ap = $ApplyCredential.GetNetworkCredential().Password
