@@ -97,6 +97,12 @@ runs AgSync with the least-privilege accounts, asserts the outcome, and cleans u
 On every push, [GitHub Actions](.github/workflows/ci.yml) builds the full 3-replica AG in Docker with throwaway
 passwords and runs the suite. No secrets are stored in the repository.
 
+| Platform | Status |
+|---|---|
+| SQL Server 2025 on Ubuntu 22.04 and 24.04 runners | Required: every push |
+| SQL Server 2022 locally (Docker on Windows) | Passing: all 22 tests |
+| SQL Server 2022 on GitHub-hosted runners | Experimental: the 2022 container spins at 100% CPU on incoming AG endpoint handshakes on these runners, so replicas never join. Under investigation; the same image passes locally. |
+
 ```powershell
 $c = New-PesterContainer -Path ./tests/AgSync.Tests.ps1 -Data @{
          Replica = $lab.Replica; AgName = $lab.AgName; ControlInstance = $lab.ControlInstance

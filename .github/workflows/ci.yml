@@ -13,12 +13,20 @@ jobs:
     # Every combination runs in parallel on its own fresh machine
     name: ${{ matrix.os }} / SQL Server ${{ matrix.sql }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 20
+    # Known issue: the SQL Server 2022 container spins at 100% CPU on incoming HADR endpoint handshakes on
+    # GitHub-hosted runners (the same image passes on Intel desktops). Those jobs run as "experimental":
+    # their result is visible in every run, but they don't turn the badge red while the issue is investigated.
+    continue-on-error: ${{ matrix.experimental }}
     strategy:
       fail-fast: false              # let every combination finish, so the results can be compared
       matrix:
         os:  [ubuntu-24.04, ubuntu-22.04]
-        sql: ['2022-latest', '2025-latest']
+        sql: ['2025-latest']
+        experimental: [false]
+        include:
+          - { os: ubuntu-24.04, sql: '2022-latest',            experimental: true }
+          - { os: ubuntu-24.04, sql: '2022-CU16-ubuntu-22.04', experimental: true }   # is it a recent-CU regression?
     env:
       MSSQL_IMAGE_TAG: ${{ matrix.sql }}
 
@@ -74,7 +82,8 @@ jobs:
           Write-Host "`n===== Container resource use =====" -ForegroundColor Cyan
           docker stats --no-stream
           Write-Host "`n===== Host =====" -ForegroundColor Cyan
-          nproc; free -m
+          nproc; free -m; uname -r
+          lscpu | Select-String 'Model name|Vendor ID|Flags' | ForEach-Object { $l = $_.Line; if ($l.Length -gt 300) { $l.Substring(0, 300) + ' ...' } else { $l } }
 
       - name: Upload test results
         if: always()
