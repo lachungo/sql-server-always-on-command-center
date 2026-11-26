@@ -22,7 +22,7 @@ live, alert on what matters, and turn incidents into evidence-backed RCAs.
 
 | Module | What it does | Status |
 |---|---|---|
-| **AG Sync** | Keeps logins, Agent jobs and new databases consistent across replicas, safely, with a full audit trail | ✅ Complete, 29 integration tests |
+| **AG Sync** | Keeps logins, Agent jobs and new databases consistent across replicas, safely, with a full audit trail | ✅ Complete, 36 integration tests incl. a failover drill |
 | **Health collector & alerts** | Snapshots roles, sync state, send/redo queues and lag; alerts on state changes, RPO breaches and disconnects | 🔨 Next |
 | **Live dashboard** | Interactive AG topology with animated data flow, lag, health assessment and sync status | 🔨 Planned |
 | **RCA toolkit** | Builds incident timelines from AlwaysOn_health events, snapshots and sync history | 🔨 Planned |
@@ -93,8 +93,12 @@ Invoke-AgSync   @lab -SqlCredential $app -ControlCredential $ctlCred -Mode Apply
 
 ## Tests
 
-29 integration tests run against a **real Availability Group**, not mocks. Each scenario builds its own drift,
+36 integration tests run against a **real Availability Group**, not mocks. Each scenario builds its own drift,
 runs AgSync with the least-privilege accounts, asserts the outcome, and cleans up.
+
+The **failover drill** fails the AG over to a secondary and proves the point of the whole module: the application
+login connects to the new primary with its original password, the role-aware job does real work there and skips on
+the old primary, and AgSync follows the new primary with no configuration change. It then always fails back.
 
 On every push, [GitHub Actions](.github/workflows/ci.yml) builds the full 3-replica AG in Docker with throwaway
 passwords and runs the suite. No secrets are stored in the repository.
@@ -128,6 +132,7 @@ sql/ControlDb.sql        control database schema (run on the controller)
 sql/AgSyncAccounts.sql   msdb permissions for the detect account (run on every replica)
 lab/New-AgLab.ps1        one-command lab: containers, certificates, endpoints, AG, seeding, accounts
 lab/docker-compose.yml   3 replicas + controller
+lab/Invoke-AgLabFailover.ps1  planned, lossless manual failover for a CLUSTER_TYPE = NONE AG
 tests/AgSync.Tests.ps1   Pester integration suite
 .github/workflows/ci.yml CI: build the AG, run the tests, on every push
 ```
@@ -138,7 +143,7 @@ tests/AgSync.Tests.ps1   Pester integration suite
 - [x] Agent jobs: step and schedule hashing, role-aware gate
 - [x] Privilege separation, audit trail, one-command lab, CI
 - [x] New databases joining the AG automatically (only when ready)
-- [ ] Failover drills: sync follows the new primary
+- [x] Failover drill: the synced logins and jobs work on the new primary, and sync follows it
 - [ ] Scale test: 1,000 logins and 500 jobs, timed
 - [ ] Linked servers and credentials
 - [ ] Health collector and alert engine

@@ -353,6 +353,88 @@ Describe 'Privilege separation' {
     }
 }
 
+Describe 'Failover: everything AgSync synced works on the new primary' {
+    # Fails over to the first secondary, proves the synced objects work there and that AgSync follows the
+    # new primary without any configuration change, then always fails back.
+
+    BeforeAll {
+        $failover = "$PSScriptRoot/../lab/Invoke-AgLabFailover.ps1"
+        $oldPrim  = $prim
+        $newPrim  = $secs[0]
+        $login    = 'pt_fo_app'
+        $newLogin = 'pt_fo_new'
+        $job      = 'pt - fo job'
+
+        Remove-TestLogin $login; Remove-TestLogin $newLogin; Remove-TestJob $job
+
+        # Set up on the original primary and let AgSync distribute it
+        Invoke-Admin $oldPrim "CREATE LOGIN [$login] WITH PASSWORD = '$pw';"
+        New-TestJob  $oldPrim $job ($guard + 'SELECT 1;')
+        Invoke-AgSync @agApply -ObjectType Login, AgentJob -Mode Apply | Out-Null
+
+        & $failover -Replica $Replica -AgName $AgName -Target $newPrim -SqlCredential $AdminCredential | Out-Null
+
+        $newPrimName = (Invoke-Admin $newPrim 'SELECT @@SERVERNAME AS n;').n
+        $oldPrimName = (Invoke-Admin $oldPrim 'SELECT @@SERVERNAME AS n;').n
+
+        function Get-LastStep1 {
+            param([string] $Instance)
+            Invoke-Admin $Instance @"
+SELECT TOP (1) h.run_status, h.message FROM msdb.dbo.sysjobhistory h
+JOIN msdb.dbo.sysjobs j ON j.job_id = h.job_id
+WHERE j.name = N'$job' AND h.step_id = 1 ORDER BY h.instance_id DESC;
+"@
+        }
+    }
+
+    AfterAll {
+        # Always restore the original topology, then clean up
+        & $failover -Replica $Replica -AgName $AgName -Target $oldPrim -SqlCredential $AdminCredential | Out-Null
+        Invoke-Admin $oldPrim "IF OBJECT_ID(N'$AgDatabase.dbo.pt_fo_write') IS NOT NULL DROP TABLE [$AgDatabase].dbo.pt_fo_write;"
+        Remove-TestLogin $login; Remove-TestLogin $newLogin; Remove-TestJob $job
+    }
+
+    It 'promotes the target to primary' {
+        $role = (Invoke-Admin $newPrim @"
+SELECT ars.role_desc AS r FROM sys.dm_hadr_availability_replica_states ars
+JOIN sys.availability_groups ag ON ag.group_id = ars.group_id
+WHERE ars.is_local = 1 AND ag.name = N'$AgName';
+"@).r
+        $role | Should -Be 'PRIMARY'
+    }
+    It 'accepts writes in the AG database on the new primary' {
+        { Invoke-Admin $newPrim "CREATE TABLE [$AgDatabase].dbo.pt_fo_write (id int);" } | Should -Not -Throw
+    }
+    It 'lets the application login connect to the new primary with its original password' {
+        $cred = New-Object pscredential $login, (ConvertTo-SecureString $pw -AsPlainText -Force)
+        (Invoke-DbaQuery -SqlInstance $newPrim -SqlCredential $cred -Query 'SELECT SUSER_SNAME() AS n;' -EnableException).n |
+            Should -Be $login
+    }
+    It 'runs the role-aware job for real on the new primary' {
+        Start-DbaAgentJob -SqlInstance $newPrim -SqlCredential $AdminCredential -Job $job -Wait | Out-Null
+        $h = Get-LastStep1 $newPrim
+        $h.run_status | Should -Be 1
+        $h.message    | Should -Not -BeLike '*skipping*'
+    }
+    It 'makes the same job skip safely on the old primary' {
+        Start-DbaAgentJob -SqlInstance $oldPrim -SqlCredential $AdminCredential -Job $job -Wait | Out-Null
+        $h = Get-LastStep1 $oldPrim
+        $h.run_status | Should -Be 1
+        $h.message    | Should -BeLike '*skipping*'
+    }
+    It 'follows the new primary: a login created there is detected with it as the source' {
+        Invoke-Admin $newPrim "CREATE LOGIN [$newLogin] WITH PASSWORD = '$pw';"
+        $d = @(Get-AgSyncDrift @agApply -ObjectType Login | Where-Object ObjectName -eq $newLogin)
+        $d.Count | Should -Be $secs.Count
+        $d.SourceReplica | Sort-Object -Unique | Should -Be $newPrimName
+        $d.TargetReplica | Should -Contain $oldPrimName
+    }
+    It 'syncs that login back to the old primary with the same SID' {
+        Invoke-AgSync @agApply -ObjectType Login -Mode Apply | Out-Null
+        Get-Sid $oldPrim $newLogin | Should -Be (Get-Sid $newPrim $newLogin)
+    }
+}
+
 Describe 'Audit trail' {
     It 'logs the latest run as completed' {
         $run = Invoke-DbaQuery @control -EnableException `

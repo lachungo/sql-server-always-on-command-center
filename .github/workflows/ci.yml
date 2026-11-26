@@ -13,7 +13,7 @@ jobs:
     # Every combination runs in parallel on its own fresh machine
     name: ${{ matrix.os }} / SQL Server ${{ matrix.sql }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15                # a passing job takes about 3 minutes
+    timeout-minutes: 25                # job-level backstop only; the build step has its own, shorter limit
     # Known issue (bisected in CI): the SQL Server 2022 CU27 container (2022-latest; build 16.0.4305.5 when tested)
     # spins at 100% CPU on incoming HADR endpoint handshakes on GitHub-hosted runners, so replicas never join.
     # CU17-CU26 and SQL Server 2025 pass on the same runners, and CU27 passes on an Intel desktop.
@@ -46,6 +46,9 @@ jobs:
 
       - name: Build the AG lab and run the tests
         shell: pwsh
+        # A step timeout FAILS the step, which continue-on-error covers for experimental jobs.
+        # (A job timeout CANCELS the whole run instead, and a cancelled run shows on the badge.)
+        timeout-minutes: 15
         run: |
           # Throwaway credentials for this run only (upper, lower, digit and symbol: meets SQL Server policy)
           function New-LabCredential([string] $User) {
