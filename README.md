@@ -1,20 +1,42 @@
-# AgSync — instance-level object sync for SQL Server Always On
+# Always On Command Center
 
-[![AgSync integration tests](https://github.com/lachungo/sql-server-ag-sync/actions/workflows/ci.yml/badge.svg)](https://github.com/lachungo/sql-server-ag-sync/actions/workflows/ci.yml)
+**Sync, live health, alerts and root-cause analysis for SQL Server Always On Availability Groups.**
 
-> 🚧 **Active work in progress.** Logins and SQL Agent jobs are complete and tested. More object types and a live AG health dashboard are on the way.
+[![Integration tests](https://github.com/lachungo/sql-server-always-on-command-center/actions/workflows/ci.yml/badge.svg)](https://github.com/lachungo/sql-server-always-on-command-center/actions/workflows/ci.yml)
+
+> 🚧 **Active work in progress.** Module 1 (AG Sync) is complete and tested on every push against a real
+> 3-replica Availability Group. The live dashboard, alerting and RCA modules are being built on the same foundation.
+
+## Why
 
 **An Availability Group replicates databases, not the instance.** Logins, SQL Agent jobs, linked servers and
 credentials live in `master` and `msdb`, and they stay behind when the AG fails over. The failover takes
 seconds; the application then can't log in, and the nightly jobs either don't exist on the new primary or
-run on every replica at once.
+run on every replica at once. Meanwhile most teams only find out the AG is unhealthy when the alert fires,
+with no picture of where the data is flowing, how far behind each replica is, or why.
 
-AgSync detects that drift and fixes it **safely**: it plans before it applies, it never drops anything on its
-own, it refuses to copy a job that would run on every replica, and it logs every decision.
+The Command Center brings that into one place: keep the replicas consistent, see the topology and data flow
+live, alert on what matters, and turn incidents into evidence-backed RCAs.
+
+## Modules
+
+| Module | What it does | Status |
+|---|---|---|
+| **AG Sync** | Detects and fixes drift in logins and Agent jobs across replicas, safely, with a full audit trail | ✅ Complete, 22 integration tests |
+| **Health collector & alerts** | Snapshots roles, sync state, send/redo queues and lag; alerts on state changes, RPO breaches and disconnects | 🔨 Next |
+| **Live dashboard** | Interactive AG topology with animated data flow, lag, health assessment and sync status | 🔨 Planned |
+| **RCA toolkit** | Builds incident timelines from AlwaysOn_health events, snapshots and sync history | 🔨 Planned |
+| **MCP tools** | Exposes the Command Center to AI agents: "is this AG healthy?", "what drifted?", "what happened at 2:14 AM?" | 🔨 Planned |
 
 ---
 
-## What it does today
+# Module 1: AG Sync
+
+AG Sync detects drift between the primary and every secondary and fixes it **safely**: it plans before it
+applies, never drops anything on its own, refuses to copy a job that would run on every replica, and logs
+every decision.
+
+## What it syncs today
 
 | Object | Compared on | Fixed by Apply |
 |---|---|---|
@@ -94,7 +116,7 @@ tests/AgSync.Tests.ps1   Pester integration suite
 .github/workflows/ci.yml CI: build the AG, run the tests, on every push
 ```
 
-## Roadmap
+## Roadmap (AG Sync and platform)
 
 - [x] Logins: SID, hash, roles, server permissions
 - [x] Agent jobs: step and schedule hashing, role-aware gate
@@ -103,7 +125,9 @@ tests/AgSync.Tests.ps1   Pester integration suite
 - [ ] Failover drills: sync follows the new primary
 - [ ] Scale test: 1,000 logins and 500 jobs, timed
 - [ ] Linked servers and credentials
-- [ ] Live AG health dashboard: topology, data flow, lag, alerts and sync status
+- [ ] Health collector and alert engine
+- [ ] Live dashboard: topology, data flow, lag, alerts and sync status
+- [ ] RCA toolkit and MCP tools
 
 ---
 

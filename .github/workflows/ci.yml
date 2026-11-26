@@ -1,6 +1,6 @@
-# AgSync CI: on every push, build a real 3-replica Always On AG in Docker and run the integration suite.
+# Always On Command Center CI: on every push, build a real 3-replica Always On AG in Docker and run the integration suite.
 # No secrets needed: every run generates throwaway passwords for a lab that exists only for that run.
-name: AgSync integration tests
+name: Integration tests
 
 on:
   push:
