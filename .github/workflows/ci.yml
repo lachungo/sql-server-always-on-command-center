@@ -14,10 +14,10 @@ jobs:
     name: ${{ matrix.os }} / SQL Server ${{ matrix.sql }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15                # a passing job takes about 3 minutes
-    # Known issue (bisected in CI): from SQL Server 2022 CU26/CU27 onwards, the 2022 container spins at 100% CPU on
-    # incoming HADR endpoint handshakes on GitHub-hosted runners, so replicas never join. CU17-CU25 and SQL Server 2025
-    # pass on the same runners, and 2022-latest passes on an Intel desktop. Experimental jobs stay visible in every run
-    # but don't turn the badge red.
+    # Known issue (bisected in CI): the SQL Server 2022 CU27 container (2022-latest; build 16.0.4305.5 when tested)
+    # spins at 100% CPU on incoming HADR endpoint handshakes on GitHub-hosted runners, so replicas never join.
+    # CU17-CU26 and SQL Server 2025 pass on the same runners, and CU27 passes on an Intel desktop.
+    # The experimental job stays visible in every run but doesn't turn the badge red.
     continue-on-error: ${{ matrix.experimental }}
     strategy:
       fail-fast: false              # let every combination finish, so the results can be compared
@@ -26,10 +26,9 @@ jobs:
           # Required: these decide the badge
           - { os: ubuntu-24.04, sql: '2025-latest',            experimental: false }
           - { os: ubuntu-22.04, sql: '2025-latest',            experimental: false }
-          - { os: ubuntu-24.04, sql: '2022-CU25-ubuntu-22.04', experimental: false }   # last 2022 update known good on runners
+          - { os: ubuntu-24.04, sql: '2022-CU26-ubuntu-22.04', experimental: false }   # last 2022 update known good on runners
           # Experimental: tracks the known issue
           - { os: ubuntu-24.04, sql: '2022-latest',            experimental: true }
-          - { os: ubuntu-24.04, sql: '2022-CU26-ubuntu-22.04', experimental: true }   # narrows it to CU26 vs CU27
     env:
       MSSQL_IMAGE_TAG: ${{ matrix.sql }}
 
