@@ -1,4 +1,4 @@
--- AgSync control database: run on the controller instance (outside the AG)
+-- AgSync control database: run on the controller instance (outside the AG). Safe to re-run.
 IF DB_ID('AgSyncControl') IS NULL CREATE DATABASE AgSyncControl;
 GO
 USE AgSyncControl;
@@ -10,7 +10,7 @@ CREATE TABLE agsync.SyncRun (
     RunId          int IDENTITY PRIMARY KEY,
     AgName         sysname        NOT NULL,
     PrimaryReplica sysname        NULL,
-    Mode           varchar(10)    NOT NULL,
+    Mode           varchar(10)    NOT NULL,              -- Detect | Apply
     StartedAt      datetime2(0)   NOT NULL DEFAULT SYSUTCDATETIME(),
     EndedAt        datetime2(0)   NULL,
     Status         varchar(20)    NOT NULL DEFAULT 'Running',
@@ -21,23 +21,24 @@ IF OBJECT_ID('agsync.DriftFinding') IS NULL
 CREATE TABLE agsync.DriftFinding (
     FindingId     bigint IDENTITY PRIMARY KEY,
     RunId         int            NOT NULL REFERENCES agsync.SyncRun(RunId),
-    ObjectType    varchar(30)    NOT NULL,
+    ObjectType    varchar(30)    NOT NULL,              -- Login | AgentJob
     ObjectName    sysname        NOT NULL,
     SourceReplica sysname        NOT NULL,
     TargetReplica sysname        NOT NULL,
-    DriftType     varchar(20)    NOT NULL,
+    DriftType     varchar(20)    NOT NULL,              -- Missing | Different | ExtraOnTarget | NotRoleAware
     Detail        nvarchar(4000) NULL,
-    Action        varchar(20)    NOT NULL DEFAULT 'Pending',
+    Action        varchar(20)    NOT NULL DEFAULT 'Pending', -- Applied | AlertOnly | Skipped | Failed
     ActionAt      datetime2(0)   NULL,
     DetectedAt    datetime2(0)   NOT NULL DEFAULT SYSUTCDATETIME());
 
 IF OBJECT_ID('agsync.ObjectExclusion') IS NULL
 CREATE TABLE agsync.ObjectExclusion (
     ObjectType        varchar(30)   NOT NULL,
-    ObjectNamePattern sysname       NOT NULL,
+    ObjectNamePattern sysname       NOT NULL,           -- SQL LIKE pattern
     Reason            nvarchar(400) NULL,
     CONSTRAINT PK_ObjectExclusion PRIMARY KEY (ObjectType, ObjectNamePattern));
 
+-- Objects that are local to each instance by design and must never be synced
 INSERT agsync.ObjectExclusion (ObjectType, ObjectNamePattern, Reason)
 SELECT v.t, v.p, v.r FROM (VALUES
     ('Login',    'sa',          'Built-in; managed per instance'),

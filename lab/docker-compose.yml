@@ -1,8 +1,10 @@
+# AgSync lab: a 3-replica Always On AG (CLUSTER_TYPE = NONE) plus a controller instance outside the AG.
+# Started by lab/New-AgLab.ps1, which sets SA_PASSWORD in the environment. Do not run on its own.
 name: aglab
 
 x-sql: &sql
   image: mcr.microsoft.com/mssql/server:2022-latest
-  environment:
+  environment: &sqlenv
     ACCEPT_EULA: "Y"
     MSSQL_PID: "Developer"
     MSSQL_SA_PASSWORD: "${SA_PASSWORD}"
@@ -31,6 +33,19 @@ services:
     ports: ["14343:1433"]
     volumes: ["agsql3data:/var/opt/mssql"]
 
+  # Controller: holds the AgSync control DB. Deliberately NOT an AG replica,
+  # so sync history and pending alerts survive a failover.
+  agctl:
+    <<: *sql
+    hostname: agctl
+    container_name: agctl
+    environment:
+      <<: *sqlenv
+      MSSQL_AGENT_ENABLED: "false"
+      MSSQL_ENABLE_HADR: "0"
+    ports: ["14340:1433"]
+    volumes: ["agctldata:/var/opt/mssql"]
+
 networks:
   agnet:
 
@@ -38,3 +53,4 @@ volumes:
   agsql1data:
   agsql2data:
   agsql3data:
+  agctldata:

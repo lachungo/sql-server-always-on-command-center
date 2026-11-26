@@ -116,7 +116,7 @@ function New-AgSyncContext {
     # Resolves the current topology once per call: who is primary, who are secondaries,
     # and how replica names (@@SERVERNAME) map to connection strings.
     param([string[]] $Replica, [string] $AgName, [pscredential] $SqlCredential,
-          [string] $ControlInstance, [string] $ControlDatabase)
+          [string] $ControlInstance, [string] $ControlDatabase, [pscredential] $ControlCredential)
 
     $roles = foreach ($r in $Replica) {
         $row = Invoke-DbaQuery -SqlInstance $r -SqlCredential $SqlCredential -Query $script:RoleQuery `
@@ -137,6 +137,9 @@ function New-AgSyncContext {
         SqlCredential   = $SqlCredential
         ControlInstance = $ControlInstance
         ControlDatabase = $ControlDatabase
+        # Control DB connection: SQL auth when a credential is given, otherwise Windows auth
+        Control         = if ($ControlCredential) { @{ SqlInstance = $ControlInstance; Database = $ControlDatabase; SqlCredential = $ControlCredential } }
+                          else                    { @{ SqlInstance = $ControlInstance; Database = $ControlDatabase } }
         Primary         = $primary[0]
         Secondaries     = @($roles | Where-Object Role -eq 'SECONDARY')
         ByName          = $byName
@@ -150,7 +153,8 @@ function New-AgSyncContext {
 function Get-AgSyncExclusion {
     # SQL LIKE patterns from the control DB, converted to PowerShell -like wildcards
     param($Ctx, [string] $ObjectType)
-    $rows = Invoke-DbaQuery -SqlInstance $Ctx.ControlInstance -Database $Ctx.ControlDatabase -EnableException `
+    $cs   = $Ctx.Control
+    $rows = Invoke-DbaQuery @cs -EnableException `
                             -Query 'SELECT ObjectNamePattern FROM agsync.ObjectExclusion WHERE ObjectType = @t;' `
                             -SqlParameter @{ t = $ObjectType }
     @(@($rows) | Where-Object { $_ } | ForEach-Object { $_.ObjectNamePattern.Replace('%', '*').Replace('_', '?') })
@@ -374,7 +378,8 @@ function Get-AgSyncJobPlan {
 
 function Start-AgSyncRun {
     param($Ctx, [string] $Mode)
-    (Invoke-DbaQuery -SqlInstance $Ctx.ControlInstance -Database $Ctx.ControlDatabase -EnableException -Query @"
+    $cs = $Ctx.Control
+    (Invoke-DbaQuery @cs -EnableException -Query @"
 INSERT agsync.SyncRun (AgName, PrimaryReplica, Mode) OUTPUT INSERTED.RunId VALUES (@ag, @pri, @mode);
 "@ -SqlParameter @{ ag = $Ctx.AgName; pri = $Ctx.Primary.Name; mode = $Mode }).RunId
 }
@@ -382,7 +387,8 @@ INSERT agsync.SyncRun (AgName, PrimaryReplica, Mode) OUTPUT INSERTED.RunId VALUE
 function Write-AgSyncFinding {
     # Logs one decision. Planned SQL is never stored: it can contain password hashes.
     param($Ctx, [int] $RunId, $Finding, [string] $Action, [string] $Note)
-    Invoke-DbaQuery -SqlInstance $Ctx.ControlInstance -Database $Ctx.ControlDatabase -EnableException -Query @"
+    $cs = $Ctx.Control
+    Invoke-DbaQuery @cs -EnableException -Query @"
 INSERT agsync.DriftFinding (RunId, ObjectType, ObjectName, SourceReplica, TargetReplica, DriftType, Detail, Action, ActionAt)
 VALUES (@run, @type, @name, @src, @tgt, @drift, @detail, @action,
         CASE WHEN @action IN ('Applied', 'Failed') THEN SYSUTCDATETIME() END);
@@ -394,7 +400,8 @@ VALUES (@run, @type, @name, @src, @tgt, @drift, @detail, @action,
 function Complete-AgSyncRun {
     param($Ctx, [int] $RunId, [string] $Status, [int] $Count, [string] $ErrorMessage)
     $err = if ($ErrorMessage) { $ErrorMessage } else { [DBNull]::Value }
-    Invoke-DbaQuery -SqlInstance $Ctx.ControlInstance -Database $Ctx.ControlDatabase -EnableException -Query @"
+    $cs = $Ctx.Control
+    Invoke-DbaQuery @cs -EnableException -Query @"
 UPDATE agsync.SyncRun
 SET EndedAt = SYSUTCDATETIME(), Status = @status, FindingCount = @cnt, ErrorMessage = @err
 WHERE RunId = @run;
@@ -442,9 +449,10 @@ function Get-AgSyncDrift {
         [Parameter(Mandatory)] [pscredential] $SqlCredential,
         [ValidateSet('Login', 'AgentJob')] [string[]] $ObjectType = @('Login', 'AgentJob'),
         [string] $ControlInstance = 'localhost',
-        [string] $ControlDatabase = 'AgSyncControl'
+        [string] $ControlDatabase = 'AgSyncControl',
+        [pscredential] $ControlCredential
     )
-    $ctx = New-AgSyncContext $Replica $AgName $SqlCredential $ControlInstance $ControlDatabase
+    $ctx = New-AgSyncContext $Replica $AgName $SqlCredential $ControlInstance $ControlDatabase $ControlCredential
     if ('Login'    -in $ObjectType) { Get-AgSyncLoginFinding $ctx }
     if ('AgentJob' -in $ObjectType) { Get-AgSyncJobFinding   $ctx }
 }
@@ -465,10 +473,11 @@ function Invoke-AgSync {
         [ValidateSet('Login', 'AgentJob')] [string[]] $ObjectType = @('Login', 'AgentJob'),
         [ValidateSet('Detect', 'Apply')]   [string]   $Mode = 'Detect',
         [string] $ControlInstance = 'localhost',
-        [string] $ControlDatabase = 'AgSyncControl'
+        [string] $ControlDatabase = 'AgSyncControl',
+        [pscredential] $ControlCredential
     )
 
-    $ctx   = New-AgSyncContext $Replica $AgName $SqlCredential $ControlInstance $ControlDatabase
+    $ctx   = New-AgSyncContext $Replica $AgName $SqlCredential $ControlInstance $ControlDatabase $ControlCredential
 
     # Fail fast, before anything is logged or changed
     if ($Mode -eq 'Apply' -and -not $ctx.CanApply) {

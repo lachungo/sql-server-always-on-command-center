@@ -9,7 +9,8 @@
     Run:
       $c = New-PesterContainer -Path .\tests\AgSync.Tests.ps1 -Data @{
                Replica = $replicas; AgName = 'aglab_ag'; ControlInstance = $ctl
-               AdminCredential = $sa; ApplyCredential = $app; DetectCredential = $det }
+               AdminCredential = $sa; ApplyCredential = $app; DetectCredential = $det
+               ControlCredential = $ctlCred }   # omit ControlCredential for Windows auth
       Invoke-Pester -Container $c -Output Detailed
 #>
 param(
@@ -19,6 +20,7 @@ param(
     [Parameter(Mandatory)] [pscredential] $AdminCredential,    # test setup and cleanup only
     [Parameter(Mandatory)] [pscredential] $ApplyCredential,
     [Parameter(Mandatory)] [pscredential] $DetectCredential,
+    [pscredential] $ControlCredential,                         # omit to use Windows auth to the controller
     [string] $AgDatabase = 'SyncLab'                           # a database in the AG, used by job guards
 )
 
@@ -27,6 +29,12 @@ BeforeAll {
 
     $agApply  = @{ Replica = $Replica; AgName = $AgName; SqlCredential = $ApplyCredential;  ControlInstance = $ControlInstance }
     $agDetect = @{ Replica = $Replica; AgName = $AgName; SqlCredential = $DetectCredential; ControlInstance = $ControlInstance }
+    $control  = @{ SqlInstance = $ControlInstance; Database = 'AgSyncControl' }
+    if ($ControlCredential) {
+        $agApply.ControlCredential  = $ControlCredential
+        $agDetect.ControlCredential = $ControlCredential
+        $control.SqlCredential      = $ControlCredential
+    }
 
     function Invoke-Admin {
         param([string] $Instance, [string] $Query)
@@ -258,7 +266,7 @@ Describe 'Privilege separation' {
 
 Describe 'Audit trail' {
     It 'logs the latest run as completed' {
-        $run = Invoke-DbaQuery -SqlInstance $ControlInstance -Database AgSyncControl -EnableException `
+        $run = Invoke-DbaQuery @control -EnableException `
                                -Query 'SELECT TOP (1) Status, EndedAt FROM agsync.SyncRun ORDER BY RunId DESC;'
         $run.Status  | Should -Be 'Succeeded'
         $run.EndedAt | Should -Not -BeNullOrEmpty
