@@ -1,0 +1,64 @@
+# AgSync CI: on every push, build a real 3-replica Always On AG in Docker and run the integration suite.
+# No secrets needed: every run generates throwaway passwords for a lab that exists only for that run.
+name: AgSync integration tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install PowerShell modules
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module dbatools -Scope CurrentUser -Force
+          Install-Module Pester -MinimumVersion 5.5 -Scope CurrentUser -Force -SkipPublisherCheck
+          Get-Module dbatools, Pester -ListAvailable | Select-Object Name, Version | Format-Table
+
+      - name: Build the AG lab and run the tests
+        shell: pwsh
+        run: |
+          # Throwaway credentials for this run only (upper, lower, digit and symbol: meets SQL Server policy)
+          function New-LabCredential([string] $User) {
+              $pw = 'Lab_9' + [guid]::NewGuid().ToString('N').Substring(0, 16) + '!'
+              [pscredential]::new($User, (ConvertTo-SecureString $pw -AsPlainText -Force))
+          }
+          $sa      = New-LabCredential 'sa'
+          $app     = New-LabCredential 'agsync_apply'
+          $det     = New-LabCredential 'agsync_detect'
+          $ctlCred = New-LabCredential 'agsync_control'
+
+          $lab = ./lab/New-AgLab.ps1 -SaCredential $sa -ApplyCredential $app -DetectCredential $det -ControlCredential $ctlCred -Reset
+
+          $container = New-PesterContainer -Path ./tests/AgSync.Tests.ps1 -Data @{
+              Replica = $lab.Replica; AgName = $lab.AgName; ControlInstance = $lab.ControlInstance
+              AdminCredential = $sa; ApplyCredential = $app; DetectCredential = $det; ControlCredential = $ctlCred }
+
+          $cfg = New-PesterConfiguration
+          $cfg.Run.Container          = $container
+          $cfg.Run.Exit               = $true          # non-zero exit code when any test fails: the build goes red
+          $cfg.Output.Verbosity       = 'Detailed'
+          $cfg.TestResult.Enabled     = $true
+          $cfg.TestResult.OutputPath  = 'testResults.xml'
+          Invoke-Pester -Configuration $cfg
+
+      - name: SQL Server logs (on failure)
+        if: failure()
+        run: docker compose -p aglab logs --tail 200
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pester-results
+          path: testResults.xml
