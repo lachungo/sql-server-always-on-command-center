@@ -19,11 +19,13 @@
 
     Notifications
       - Channels: Slack (one message per alert event: an incident queue) and email (one digest per run, for the DBAs).
-      - Events: Opened, Escalated (Warning -> Critical), Resolved. Downgrades are not announced.
+      - Events: Opened, Escalated (Warning -> Critical), Reminder (still open, on a schedule), Resolved.
+        Downgrades are not announced. Reminder schedules are data (aghealth.ReminderPolicy, per-rule overrides).
       - Every attempt is logged per alert, channel and event, so a failed channel is retried on the next run
         and a channel that already succeeded is never sent the same event twice.
       - Secrets (webhook URL, SMTP password) never live in the repo or the database: on Windows they are stored
-        with DPAPI under the current user's profile (Save-AgHealthSecret).
+        with DPAPI under the current user's profile (Save-AgHealthSecret), per user or, for a background task
+        that stores no password, per machine with the file restricted to the user.
 
     Public functions
       Invoke-AgHealthCollection - take one snapshot and store it
@@ -359,8 +361,12 @@ UPDATE aghealth.Snapshot SET Status = 'Failed', ErrorMessage = LEFT(@err, 4000),
 function Get-AgHealthEventStyle {
     # Label, colour and Slack emoji for one event
     param($AlertEvent)
+    $dot = [char]0x00B7
     switch ($true) {
         ($AlertEvent.Event -eq 'Resolved')        { return @{ Label = 'RESOLVED'; Color = '#039855'; Tint = '#ecfdf3'; Emoji = ':large_green_circle:' } }
+        ($AlertEvent.Event -eq 'Reminder' -and $AlertEvent.Severity -eq 'Critical') {
+                                                    return @{ Label = "REMINDER $dot CRITICAL"; Color = '#d92d20'; Tint = '#fef3f2'; Emoji = ':bell:' } }
+        ($AlertEvent.Event -eq 'Reminder')        { return @{ Label = "REMINDER $dot WARNING";  Color = '#dc6803'; Tint = '#fffaeb'; Emoji = ':bell:' } }
         ($AlertEvent.Event -eq 'Escalated')       { return @{ Label = 'ESCALATED TO CRITICAL'; Color = '#d92d20'; Tint = '#fef3f2'; Emoji = ':red_circle:' } }
         ($AlertEvent.Severity -eq 'Critical')     { return @{ Label = 'CRITICAL'; Color = '#d92d20'; Tint = '#fef3f2'; Emoji = ':red_circle:' } }
         default                                   { return @{ Label = 'WARNING';  Color = '#dc6803'; Tint = '#fffaeb'; Emoji = ':large_orange_circle:' } }
@@ -438,6 +444,12 @@ function Get-AgHealthEventView {
         # Opened/escalated: how long it has been going on. Resolved: how long it lasted, and how bad it got.
         Timing   = if ($resolved) { 'Was {0} for {1}' -f (Get-AgHealthText $AlertEvent.Severity).ToLower(), (Format-AgHealthDuration ($ended - $first)) }
                    else           { '{0:HH:mm} UTC ({1} ago)' -f $first, (Format-AgHealthDuration ($NowUtc - $first)) }
+        # What the Event field says: 'Opened', 'Escalated', 'Resolved' or 'Reminder 2 of 8'
+        EventText = if ($AlertEvent.Event -eq 'Reminder') {
+                        $n = Get-AgHealthText $AlertEvent.ReminderNumber; $m = Get-AgHealthText $AlertEvent.MaxReminders
+                        if ($n -and $m) { "Reminder $n of $m" } else { 'Reminder' }
+                    } else { Get-AgHealthText $AlertEvent.Event }
+        IsReminder = $AlertEvent.Event -eq 'Reminder'
         Runbook  = if ($resolved) { '' } else { Get-AgHealthText $AlertEvent.Runbook }
         AlertId  = $AlertEvent.AlertId
         Rank     = if ($resolved) { 3 } elseif ($AlertEvent.Severity -eq 'Critical') { 1 } else { 2 }
@@ -458,7 +470,7 @@ function ConvertTo-AgHealthSlackMessage {
                    @{ type = 'mrkdwn'; text = "*Now*`n$($v.Now)" }
                    @{ type = 'mrkdwn'; text = "*Expected*`n$($v.Expected)" }
                    @{ type = 'mrkdwn'; text = "*$(if ($v.Event -eq 'Resolved') { 'Duration' } else { 'Started' })*`n$($v.Timing)" }
-                   @{ type = 'mrkdwn'; text = "*Event*`n$($v.Event)" }) })
+                   @{ type = 'mrkdwn'; text = "*Event*`n$($v.EventText)" }) })
     if ($v.Runbook) {
         $blocks.Add(@{ type = 'section'; text = @{ type = 'mrkdwn'; text = "*What to check*`n$($v.Runbook)" } })
     }
@@ -466,13 +478,14 @@ function ConvertTo-AgHealthSlackMessage {
                    text = ((@($Brand.Name, $Brand.Product) | Where-Object { $_ }) -join "  $dot  ") +
                           "  $dot  Alert #$($v.AlertId)  $dot  rule ``$($v.Rule)``" }) })
     @{
-        text        = "$($v.Style.Label): $($v.Title) on $($v.Path -join ' / ')"     # notification preview
+        text        = "$($v.Style.Label): $($v.Title) on $($v.Path -join ' / ')$(if ($v.IsReminder) { " ($($v.EventText.ToLower()))" })"     # notification preview
         attachments = @(@{ color = $v.Style.Color; blocks = $blocks.ToArray() })
     } | ConvertTo-Json -Depth 10 -Compress
 }
 
 function ConvertTo-AgHealthEmail {
     # One branded HTML digest per run. Inline styles and tables only: what Gmail and Outlook render reliably.
+    # Fluid width: it fills the reading pane on a desktop and narrows on a phone.
     param([object[]] $Events, $Brand = (Get-AgHealthDefaultBrand), [datetime] $NowUtc = [datetime]::UtcNow)
     if (-not $Brand) { $Brand = Get-AgHealthDefaultBrand }       # channels made before branding existed
     $enc   = { param($x) [Net.WebUtility]::HtmlEncode([string]$x) }
@@ -488,6 +501,8 @@ function ConvertTo-AgHealthEmail {
     if ($warn) { $parts += "$warn Warning$(if ($warn -gt 1) { 's' })" }
     if ($res)  { $parts += "$res Resolved" }
     $summary = $parts -join ', '
+    # Only reminders in this run: say so up front, so it reads as "still broken", not as a new incident
+    if (-not @($views | Where-Object { -not $_.IsReminder }).Count) { $summary = "Still open: $summary" }
     $subject = "[AG $ags] $summary"
 
     $pill = {
@@ -511,7 +526,7 @@ function ConvertTo-AgHealthEmail {
 <tr><td style='padding:16px 18px'>
   <span style='display:inline-block;padding:2px 8px;border-radius:4px;background:$($v.Style.Color);color:#ffffff;font-size:11px;font-weight:700;letter-spacing:.4px'>$(& $enc $v.Style.Label)</span>
   <div style='font-size:16px;font-weight:600;color:#101828;margin-top:8px'>$(& $enc $v.Title)</div>
-  <div style='font-family:Consolas,Menlo,monospace;font-size:12px;color:#667085;margin-top:2px'>$(& $enc ($v.Path -join ' / '))</div>
+  <div style='font-family:Consolas,Menlo,monospace;font-size:12px;color:#667085;margin-top:2px'>$(& $enc ($v.Path -join ' / '))$(if ($v.IsReminder) { " &middot; $(& $enc $v.EventText)" })</div>
   <table width='100%' cellpadding='0' cellspacing='0' style='margin-top:12px;font-size:13px'>
   <tr>
     <td width='33%' valign='top'><div style='color:#667085;font-size:11px;text-transform:uppercase;letter-spacing:.5px'>Now</div><div style='color:#101828;font-weight:600'>$(& $enc $v.Now)</div></td>
@@ -533,7 +548,7 @@ function ConvertTo-AgHealthEmail {
     # Footer: who sent it, how to reach them, and what generated it
     $line1 = (@(
         $(if ($Brand.Name)    { "<b style='color:#344054'>$(& $enc $Brand.Name)</b>" })
-        $(if ($Brand.Tagline) { "<i>$(& $enc $Brand.Tagline)</i>" })) | Where-Object { $_ }) -join $dot
+        $(if ($Brand.Tagline) { "&ldquo;$(& $enc $Brand.Tagline)&rdquo;" })) | Where-Object { $_ }) -join $dot
     $line2 = (@(
         $(if ($Brand.Url)     { "<a href='$(& $enc $Brand.Url)' style='color:#475467;text-decoration:none'>$(& $enc ($Brand.Url -replace '^https?://', ''))</a>" })
         $(if ($Brand.Contact) { "<a href='mailto:$(& $enc $Brand.Contact)' style='color:#475467;text-decoration:none'>$(& $enc $Brand.Contact)</a>" })) | Where-Object { $_ }) -join $dot
@@ -542,8 +557,8 @@ function ConvertTo-AgHealthEmail {
     $body = @"
 <!DOCTYPE html><html><body style='margin:0;padding:0;background:#f2f4f7'>
 <div style='display:none;max-height:0;overflow:hidden'>$(& $enc "$summary on $ags")</div>
-<table width='100%' cellpadding='0' cellspacing='0' style='background:#f2f4f7'><tr><td align='center' style='padding:28px 12px'>
-<table width='640' cellpadding='0' cellspacing='0' style='max-width:640px;background:#ffffff;border-radius:12px;overflow:hidden;font-family:Segoe UI,Helvetica,Arial,sans-serif'>
+<table width='100%' cellpadding='0' cellspacing='0' style='background:#f2f4f7'><tr><td align='center' style='padding:16px'>
+<table width='100%' cellpadding='0' cellspacing='0' style='width:100%;background:#ffffff;border-radius:12px;overflow:hidden;font-family:Segoe UI,Helvetica,Arial,sans-serif'>
 <tr><td style='background:#0b1220;padding:20px 28px'>
   <table width='100%' cellpadding='0' cellspacing='0'><tr>
     <td valign='middle'><table cellpadding='0' cellspacing='0'><tr>$logo<td valign='middle'>$company$product</td></tr></table></td>
@@ -759,8 +774,9 @@ SELECT AlertId, Channel, EventKey FROM aghealth.Notification WHERE Status = 'Sen
     foreach ($ch in $Channel) {
         $todo = @($pending | Where-Object {
             -not $done.Contains("$($_.AlertId)|$($ch.Name)|$($_.EventKey)") -and
-            # A channel that never announced the alert doesn't get its resolution out of nowhere
-            ($_.EventKey -ne 'Resolved' -or $openSent.Contains("$($_.AlertId)|$($ch.Name)"))
+            # A channel that never announced the alert gets neither its reminders nor its resolution
+            (($_.EventKey -ne 'Resolved' -and $_.EventKey -notlike 'Reminder:*') -or
+             $openSent.Contains("$($_.AlertId)|$($ch.Name)"))
         })
         if (-not $todo.Count) { continue }
 
@@ -787,33 +803,86 @@ SELECT AlertId, Channel, EventKey FROM aghealth.Notification WHERE Status = 'Sen
 }
 
 function Get-AgHealthSecretPath {
-    param([string] $Name)
+    param([string] $Name, [ValidateSet('User', 'Machine')] [string] $Scope = 'User')
     if (-not $IsWindows -and $PSVersionTable.PSEdition -eq 'Core') {
         throw 'Saved secrets use Windows DPAPI. On other platforms, pass credentials directly.'
     }
-    Join-Path $env:LOCALAPPDATA "AlwaysOnCommandCenter\secrets\$Name.xml"
+    $root = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'AlwaysOnCommandCenter\secrets'
+    if ($Scope -eq 'Machine') { Join-Path $root "machine\$Name.json" } else { Join-Path $root "$Name.xml" }
 }
 
 function Save-AgHealthSecret {
     <#
     .SYNOPSIS
-        Stores a credential encrypted for the current Windows user (DPAPI), outside the repo.
+        Stores a credential, encrypted with Windows DPAPI, outside the repo.
+    .DESCRIPTION
+        -Scope User (default): encrypted with your Windows sign-in. Strongest; readable only when you are
+            signed in, or by a task that stores your Windows password.
+        -Scope Machine: encrypted with this computer's key, and the file is restricted to your account.
+            Readable by a background task that stores no password (Task Scheduler "S4U"). Trade-off:
+            an administrator of this computer could also read it. Fine for a lab or a dedicated monitoring host.
     .EXAMPLE
         Save-AgHealthSecret -Name Gmail -Credential (Get-Credential achungolm@gmail.com)
+    .EXAMPLE
+        # Copy an existing secret to the machine store, for a no-password background task
+        Save-AgHealthSecret -Name Gmail -Credential (Get-AgHealthSecret Gmail -Scope User) -Scope Machine
     #>
     param([Parameter(Mandatory)] [ValidatePattern('^[A-Za-z0-9_-]+$')] [string] $Name,
-          [Parameter(Mandatory)] [pscredential] $Credential)
-    $path = Get-AgHealthSecretPath $Name
+          [Parameter(Mandatory)] [pscredential] $Credential,
+          [ValidateSet('User', 'Machine')] [string] $Scope = 'User')
+    $path = Get-AgHealthSecretPath $Name $Scope
     $null = New-Item -ItemType Directory -Path (Split-Path $path) -Force
-    $Credential | Export-Clixml -Path $path -Force
-    Write-Verbose "Saved $Name to $path (readable only by $env:USERNAME on $env:COMPUTERNAME)."
+
+    if ($Scope -eq 'User') {
+        $Credential | Export-Clixml -Path $path -Force
+    }
+    else {
+        Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue
+        $entropy = [Text.Encoding]::UTF8.GetBytes("AlwaysOnCommandCenter:$Name")
+        $plain   = [Text.Encoding]::UTF8.GetBytes($Credential.GetNetworkCredential().Password)
+        try   { $blob = [Security.Cryptography.ProtectedData]::Protect($plain, $entropy, 'LocalMachine') }
+        finally { [Array]::Clear($plain, 0, $plain.Length) }
+        $doc = [ordered]@{ v = 1; scope = 'Machine'; user = $Credential.UserName
+                           secret = [Convert]::ToBase64String($blob) } | ConvertTo-Json
+
+        # Lock the file down to this account BEFORE anything secret is written to it
+        $null = New-Item -ItemType File -Path $path -Force
+        $acl  = Get-Acl -Path $path
+        $acl.SetAccessRuleProtection($true, $false)                       # no inherited permissions
+        foreach ($rule in @($acl.Access)) { $null = $acl.RemoveAccessRule($rule) }
+        $me = [Security.Principal.WindowsIdentity]::GetCurrent().User
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($me, 'FullControl', 'Allow'))
+        Set-Acl -Path $path -AclObject $acl
+        Set-Content -Path $path -Value $doc -Encoding utf8
+    }
+    Write-Verbose "Saved $Name ($Scope scope) to $path."
 }
 
 function Get-AgHealthSecret {
-    param([Parameter(Mandatory)] [string] $Name)
-    $path = Get-AgHealthSecretPath $Name
-    if (-not (Test-Path $path)) { throw "Secret '$Name' not found. Save it first with Save-AgHealthSecret." }
-    Import-Clixml -Path $path
+    <#
+    .SYNOPSIS
+        Reads a saved credential. -Scope Any (default) prefers the machine store, then the user store.
+    #>
+    param([Parameter(Mandatory)] [string] $Name,
+          [ValidateSet('Any', 'User', 'Machine')] [string] $Scope = 'Any')
+    $machine = Get-AgHealthSecretPath $Name 'Machine'
+    $user    = Get-AgHealthSecretPath $Name 'User'
+
+    if ($Scope -in 'Any', 'Machine' -and (Test-Path $machine)) {
+        Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue
+        $doc     = Get-Content -Path $machine -Raw | ConvertFrom-Json
+        $entropy = [Text.Encoding]::UTF8.GetBytes("AlwaysOnCommandCenter:$Name")
+        $plain   = [Security.Cryptography.ProtectedData]::Unprotect([Convert]::FromBase64String($doc.secret), $entropy, 'LocalMachine')
+        try {
+            $secure = ConvertTo-SecureString ([Text.Encoding]::UTF8.GetString($plain)) -AsPlainText -Force
+            return [pscredential]::new($doc.user, $secure)
+        }
+        finally { [Array]::Clear($plain, 0, $plain.Length) }
+    }
+    if ($Scope -in 'Any', 'User' -and (Test-Path $user)) {
+        return Import-Clixml -Path $user
+    }
+    throw "Secret '$Name' not found (scope $Scope). Save it first with Save-AgHealthSecret."
 }
 
 #endregion

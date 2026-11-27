@@ -124,6 +124,31 @@ IF COL_LENGTH('aghealth.Alert', 'ResolvedNotifiedAt') IS NULL
     ALTER TABLE aghealth.Alert ADD ResolvedNotifiedAt datetime2(3) NULL;
 GO
 
+-- Reminders: an alert that stays open is announced again, on a schedule, so silence never looks like health.
+-- The schedule is data: a default per severity, optionally overridden per rule (RepeatMinutes 0 = never remind).
+IF COL_LENGTH('aghealth.Alert', 'ReminderCount') IS NULL
+    ALTER TABLE aghealth.Alert ADD ReminderCount int NOT NULL CONSTRAINT DF_Alert_ReminderCount DEFAULT 0;
+IF COL_LENGTH('aghealth.Alert', 'LastRemindedAt') IS NULL
+    ALTER TABLE aghealth.Alert ADD LastRemindedAt datetime2(3) NULL;
+IF COL_LENGTH('aghealth.AlertRule', 'RepeatMinutes') IS NULL
+    ALTER TABLE aghealth.AlertRule ADD RepeatMinutes int NULL;      -- NULL: use the severity's policy; 0: never
+IF COL_LENGTH('aghealth.AlertRule', 'MaxRepeats') IS NULL
+    ALTER TABLE aghealth.AlertRule ADD MaxRepeats int NULL;         -- NULL: use the severity's policy
+GO
+IF OBJECT_ID('aghealth.ReminderPolicy') IS NULL
+CREATE TABLE aghealth.ReminderPolicy (
+    Severity      varchar(10) NOT NULL CONSTRAINT PK_ReminderPolicy PRIMARY KEY,
+    RepeatMinutes int         NOT NULL,     -- 0 = never remind
+    MaxRepeats    int         NOT NULL,
+    CONSTRAINT CK_ReminderPolicy_Severity CHECK (Severity IN ('Warning','Critical')),
+    CONSTRAINT CK_ReminderPolicy_Values   CHECK (RepeatMinutes >= 0 AND MaxRepeats >= 0));
+GO
+INSERT aghealth.ReminderPolicy (Severity, RepeatMinutes, MaxRepeats)
+SELECT v.Severity, v.RepeatMinutes, v.MaxRepeats
+FROM (VALUES ('Critical', 30, 8), ('Warning', 240, 3)) v(Severity, RepeatMinutes, MaxRepeats)
+WHERE NOT EXISTS (SELECT 1 FROM aghealth.ReminderPolicy p WHERE p.Severity = v.Severity);
+GO
+
 -- Notification log, one row per alert, channel and event. It is what makes delivery safe to retry:
 -- if Slack succeeded and email failed, the next run retries email only, and Slack never gets a duplicate.
 --   EventKey: Open:Warning | Open:Critical | Resolved
@@ -325,6 +350,9 @@ BEGIN
     UPDATE a
     SET LastSeenAt = @At, LastSnapshotId = @SnapshotId, LastValue = n.Value, Message = n.Message,
         NotifiedAt = CASE WHEN a.Severity = 'Warning' AND n.Severity = 'Critical' THEN NULL ELSE a.NotifiedAt END,
+        -- A new severity has its own reminder schedule
+        ReminderCount  = CASE WHEN a.Severity <> n.Severity THEN 0    ELSE a.ReminderCount  END,
+        LastRemindedAt = CASE WHEN a.Severity <> n.Severity THEN NULL ELSE a.LastRemindedAt END,
         Severity   = n.Severity
     OUTPUT inserted.AlertId,
            CASE WHEN deleted.Severity = 'Warning'  AND inserted.Severity = 'Critical' THEN 'Escalated'
@@ -375,6 +403,7 @@ GO
 -- Escalated means a channel already announced a different severity of this alert; a retry is not an escalation.
 CREATE OR ALTER VIEW aghealth.PendingNotification
 AS
+-- New, escalated and resolved alerts
 SELECT a.AlertId, a.AgName, a.ReplicaServerName, a.DatabaseName, a.Severity, a.State, r.RuleName,
        a.LastValue, a.Message, a.FirstSeenAt, a.LastSeenAt, a.ResolvedAt,
        r.Metric, r.Operator, r.ExpectedValue, r.WarnThreshold, r.CritThreshold, r.Description, r.Runbook,
@@ -384,13 +413,36 @@ SELECT a.AlertId, a.AgName, a.ReplicaServerName, a.DatabaseName, a.Severity, a.S
                          WHERE n.AlertId = a.AlertId AND n.Status = 'Sent'
                            AND n.EventKey LIKE 'Open:%' AND n.EventKey <> 'Open:' + a.Severity)
                  THEN 'Escalated'
-            ELSE 'Opened' END AS Event
+            ELSE 'Opened' END AS Event,
+       CAST(NULL AS int) AS ReminderNumber, CAST(NULL AS int) AS MaxReminders
 FROM aghealth.Alert a
 JOIN aghealth.AlertRule r ON r.RuleId = a.RuleId
 WHERE (a.State = 'Open' AND a.NotifiedAt IS NULL)
    OR (a.State = 'Resolved' AND a.ResolvedNotifiedAt IS NULL
        AND EXISTS (SELECT 1 FROM aghealth.Notification n
-                   WHERE n.AlertId = a.AlertId AND n.Status = 'Sent' AND n.EventKey LIKE 'Open:%'));
+                   WHERE n.AlertId = a.AlertId AND n.Status = 'Sent' AND n.EventKey LIKE 'Open:%'))
+
+UNION ALL
+
+-- Reminders: still open, fully announced, and its next reminder is due
+SELECT a.AlertId, a.AgName, a.ReplicaServerName, a.DatabaseName, a.Severity, a.State, r.RuleName,
+       a.LastValue, a.Message, a.FirstSeenAt, a.LastSeenAt, a.ResolvedAt,
+       r.Metric, r.Operator, r.ExpectedValue, r.WarnThreshold, r.CritThreshold, r.Description, r.Runbook,
+       CONCAT('Reminder:', a.Severity, ':', a.ReminderCount + 1) AS EventKey,
+       'Reminder' AS Event,
+       a.ReminderCount + 1 AS ReminderNumber, pol.MaxRepeats AS MaxReminders
+FROM aghealth.Alert a
+JOIN aghealth.AlertRule r ON r.RuleId = a.RuleId
+CROSS APPLY (SELECT COALESCE(r.RepeatMinutes, p.RepeatMinutes) AS RepeatMinutes,
+                    COALESCE(r.MaxRepeats,    p.MaxRepeats)    AS MaxRepeats
+             FROM aghealth.ReminderPolicy p WHERE p.Severity = a.Severity) pol
+WHERE a.State = 'Open'
+  AND a.NotifiedAt IS NOT NULL
+  AND pol.RepeatMinutes > 0
+  AND a.ReminderCount < pol.MaxRepeats
+  AND DATEDIFF(SECOND, COALESCE(a.LastRemindedAt, a.NotifiedAt), SYSUTCDATETIME()) >= pol.RepeatMinutes * 60
+  AND EXISTS (SELECT 1 FROM aghealth.Notification n
+              WHERE n.AlertId = a.AlertId AND n.Status = 'Sent' AND n.EventKey LIKE 'Open:%');
 GO
 
 -- Records one delivery attempt (insert the first time, count retries after that)
@@ -414,8 +466,8 @@ BEGIN
 END;
 GO
 
--- Marks an event announced once every channel that owes it has it. Returns 1 if the alert is now fully announced.
--- A resolution is owed only by the channels that announced the alert as open.
+-- Marks an event announced once every channel that owes it has it. Returns 1 if the event is now fully announced.
+-- A resolution or a reminder is owed only by the channels that announced the alert as open.
 CREATE OR ALTER PROCEDURE aghealth.usp_CompleteNotification
     @AlertId  bigint,
     @EventKey varchar(20),
@@ -424,7 +476,7 @@ AS
 BEGIN
     SET NOCOUNT ON;
     DECLARE @needed int =
-        CASE WHEN @EventKey = 'Resolved'
+        CASE WHEN @EventKey = 'Resolved' OR @EventKey LIKE 'Reminder:%'
              THEN (SELECT COUNT(DISTINCT n.Channel) FROM aghealth.Notification n
                    WHERE n.AlertId = @AlertId AND n.Status = 'Sent' AND n.EventKey LIKE 'Open:%'
                      AND n.Channel IN (SELECT value FROM OPENJSON(@Channels)))
@@ -434,10 +486,19 @@ BEGIN
                            AND n.Channel IN (SELECT value FROM OPENJSON(@Channels)));
     IF @sent < @needed BEGIN SELECT CAST(0 AS bit) AS Completed; RETURN; END;
 
-    UPDATE aghealth.Alert
-    SET NotifiedAt         = CASE WHEN @EventKey <> 'Resolved' THEN SYSUTCDATETIME() ELSE NotifiedAt END,
-        ResolvedNotifiedAt = CASE WHEN @EventKey  = 'Resolved' THEN SYSUTCDATETIME() ELSE ResolvedNotifiedAt END
-    WHERE AlertId = @AlertId;
+    IF @EventKey LIKE 'Reminder:%'
+    BEGIN
+        -- 'Reminder:<Severity>:<n>': record reminder n as sent (idempotent)
+        DECLARE @n int = TRY_CAST(RIGHT(@EventKey, CHARINDEX(':', REVERSE(@EventKey)) - 1) AS int);
+        UPDATE aghealth.Alert
+        SET ReminderCount = @n, LastRemindedAt = SYSUTCDATETIME()
+        WHERE AlertId = @AlertId AND ReminderCount < @n;
+    END
+    ELSE
+        UPDATE aghealth.Alert
+        SET NotifiedAt         = CASE WHEN @EventKey <> 'Resolved' THEN SYSUTCDATETIME() ELSE NotifiedAt END,
+            ResolvedNotifiedAt = CASE WHEN @EventKey  = 'Resolved' THEN SYSUTCDATETIME() ELSE ResolvedNotifiedAt END
+        WHERE AlertId = @AlertId;
     SELECT CAST(1 AS bit) AS Completed;
 END;
 GO

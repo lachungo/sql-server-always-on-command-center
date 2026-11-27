@@ -446,6 +446,79 @@ DELETE aghealth.AlertRule WHERE RuleName = 'pt_Outage';
     }
 }
 
+Describe 'Reminders: an alert that stays open is announced again, on schedule, then stops' {
+    BeforeAll {
+        # Always breaches; reminders every 60 minutes, at most 2 (a per-rule override of the severity policy)
+        Invoke-Ctl @"
+INSERT aghealth.AlertRule (RuleName, Scope, Metric, Operator, WarnThreshold, CritThreshold, ConsecutiveSnapshots, RepeatMinutes, MaxRepeats, Description)
+VALUES ('pt_Remind', 'Ag', 'DurationMs', '>', -2, 1000000, 1, 60, 2, N'Reminder test rule');
+"@
+        $notify = @{ ControlInstance = $ControlInstance; AgName = $AgName }
+        if ($ControlCredential) { $notify.ControlCredential = $ControlCredential }
+
+        function Send-Test {
+            # One notifier run on a fresh pair of channels; returns this rule's events and the email render
+            $slack = New-AgHealthTestChannel -Name pt_RSlack
+            $email = New-AgHealthTestChannel -Name pt_REmail -Mode Digest
+            $rows  = @(Send-AgHealthNotification @notify -Channel $slack, $email | Where-Object RuleName -eq 'pt_Remind')
+            [pscustomobject]@{ Rows = $rows; Slack = $slack; Email = $email }
+        }
+        function Move-ClockBack {
+            # Pretend the last notice (and last reminder) happened 61 minutes ago
+            Invoke-Ctl @"
+UPDATE a SET NotifiedAt = DATEADD(MINUTE, -61, NotifiedAt),
+             LastRemindedAt = DATEADD(MINUTE, -61, LastRemindedAt)
+FROM aghealth.Alert a JOIN aghealth.AlertRule r ON r.RuleId = a.RuleId
+WHERE r.RuleName = 'pt_Remind' AND a.State = 'Open';
+"@
+        }
+
+        $null    = Invoke-Collect                     # opens (Warning)
+        $opened  = Send-Test
+        $tooSoon = Send-Test                          # nothing due yet
+        Move-ClockBack
+        $first   = Send-Test                          # reminder 1 of 2
+        $again   = Send-Test                          # not due again yet
+        Move-ClockBack
+        $second  = Send-Test                          # reminder 2 of 2
+        Move-ClockBack
+        $capped  = Send-Test                          # the cap holds: nothing
+
+        Invoke-Ctl "UPDATE aghealth.AlertRule SET IsEnabled = 0 WHERE RuleName = 'pt_Remind';"
+        $null     = Invoke-Collect                    # resolves
+        $resolved = Send-Test
+    }
+    AfterAll {
+        Invoke-Ctl @"
+DELETE a FROM aghealth.Alert a JOIN aghealth.AlertRule r ON r.RuleId = a.RuleId WHERE r.RuleName = 'pt_Remind';
+DELETE aghealth.AlertRule WHERE RuleName = 'pt_Remind';
+"@
+    }
+
+    It 'announces the alert once, then stays quiet until a reminder is due' {
+        @($opened.Rows | Where-Object Event -eq 'Opened').Count | Should -Be 2     # Slack and email
+        $tooSoon.Rows.Count | Should -Be 0
+    }
+    It 'sends reminder 1 on every channel once the interval has passed' {
+        @($first.Rows | Where-Object { $_.Event -eq 'Reminder' -and $_.Status -eq 'Sent' }).Count | Should -Be 2
+        $again.Rows.Count | Should -Be 0
+    }
+    It 'labels a reminder clearly in Slack and email' {
+        $card = $first.Slack.Rendered[0].Slack[0] | ConvertFrom-Json
+        $card.attachments[0].blocks[0].text.text | Should -Match 'REMINDER'
+        $card.attachments[0].blocks[1].fields[3].text | Should -Match 'Reminder 1 of 2'
+        $first.Email.Rendered[0].Email.Subject | Should -Be "[AG $AgName] Still open: 1 Warning"
+    }
+    It 'sends reminder 2, then stops at the cap' {
+        @($second.Rows | Where-Object Event -eq 'Reminder').Count | Should -Be 2
+        $second.Slack.Rendered[0].Slack[0] | Should -Match 'Reminder 2 of 2'
+        $capped.Rows.Count | Should -Be 0
+    }
+    It 'still announces the resolution after the reminders' {
+        @($resolved.Rows | Where-Object { $_.Event -eq 'Resolved' -and $_.Status -eq 'Sent' }).Count | Should -Be 2
+    }
+}
+
 Describe 'Monitor runner (the scheduled pass)' {
     BeforeAll {
         $tmp = Join-Path ([IO.Path]::GetTempPath()) ('aghealth-' + [guid]::NewGuid().ToString('N'))
@@ -492,5 +565,31 @@ Describe 'Monitor runner (the scheduled pass)' {
         & $runner -ConfigPath $bad -LogDirectory $tmp
         $LASTEXITCODE | Should -Be 3
         (Get-RunLog) -join "`n" | Should -Match "'AgName' is missing"
+    }
+}
+
+Describe 'Secrets: machine store for no-password background tasks' -Skip:(-not $IsWindows) {
+    BeforeAll {
+        $name = 'pt_Secret_' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+        $cred = [pscredential]::new('pt_user@example.com', (ConvertTo-SecureString 'Pt-S3cret!value' -AsPlainText -Force))
+        Save-AgHealthSecret -Name $name -Credential $cred -Scope Machine
+        $path = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) "AlwaysOnCommandCenter\secrets\machine\$name.json"
+    }
+    AfterAll { Remove-Item -Path $path -Force -ErrorAction SilentlyContinue }
+
+    It 'reads back the same user name and password' {
+        $back = Get-AgHealthSecret $name -Scope Machine
+        $back.UserName | Should -Be 'pt_user@example.com'
+        $back.GetNetworkCredential().Password | Should -Be 'Pt-S3cret!value'
+    }
+    It 'never writes the password in plain text' {
+        Get-Content -Path $path -Raw | Should -Not -Match 'Pt-S3cret'
+    }
+    It 'restricts the file to the current account, with no inherited permissions' {
+        $acl = Get-Acl -Path $path
+        $acl.AreAccessRulesProtected | Should -BeTrue
+        @($acl.Access).Count | Should -Be 1
+        @($acl.Access)[0].IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value |
+            Should -Be ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
     }
 }

@@ -7,9 +7,12 @@
     and registers a task that runs ops/Invoke-AgHealthMonitor.ps1 with it.
 
     - Runs as you: the saved secrets are encrypted for your Windows profile, so the task must run as the same user.
-    - With -WindowsCredential it runs in the background ("whether user is logged on or not"): no window, and it
-      keeps running when you lock the screen or sign out. Windows stores that sign-in, encrypted, for the task.
-      Without it, the task runs only while you are signed in, and a console window briefly shows each minute.
+    Three ways to run, pick one:
+    - -NoStoredPassword: background, no window, and no Windows password stored or needed (Task Scheduler "S4U").
+      Works on PCs that sign in with Windows Hello only. Needs the secrets in the machine store
+      (Save-AgHealthSecret -Scope Machine): such a task cannot read secrets tied to your password.
+    - -WindowsCredential: background, no window; Windows stores your sign-in, encrypted, for the task.
+    - Neither: runs only while you are signed in, and a console window briefly shows each minute.
     - A plain pwsh -File launch, without -ExecutionPolicy Bypass or a hidden console host: antivirus rightly treats
       hidden, policy-bypassing PowerShell as suspicious, so the monitor does nothing that looks like that.
     - Never overlaps: the task ignores a new start while one is running, and the runner has its own lock.
@@ -22,7 +25,7 @@
     ./ops/Register-AgHealthMonitor.ps1 -Replica $lab.Replica -AgName $lab.AgName -ControlInstance $lab.ControlInstance `
         -TrustServerCertificate -SlackSecret SlackWebhook -EmailSecret Gmail -EmailTo info@sql-it-techsolutions.com `
         -Brand @{ Name = 'SQL-IT-Tech Solutions'; SourceName = 'SQL-IT-TECHSOLUTIONS' } `
-        -WindowsCredential (Get-Credential "$env:USERDOMAIN\$env:USERNAME") -RunNow
+        -NoStoredPassword -RunNow
 
 .EXAMPLE
     ./ops/Register-AgHealthMonitor.ps1 -AgName aglab_ag -Unregister
@@ -47,6 +50,7 @@ param(
     [Parameter(ParameterSetName = 'Register')] [switch] $TrustServerCertificate,
     [Parameter(ParameterSetName = 'Register')] [ValidateRange(1, 60)] [int] $EveryMinutes = 1,
     [Parameter(ParameterSetName = 'Register')] [pscredential] $WindowsCredential,   # your Windows sign-in: run in the background
+    [Parameter(ParameterSetName = 'Register')] [switch] $NoStoredPassword,          # background with no password (S4U)
     [Parameter(ParameterSetName = 'Register')] [switch] $RunNow,
     [Parameter(Mandatory, ParameterSetName = 'Unregister')] [switch] $Unregister
 )
@@ -65,10 +69,19 @@ if ($Unregister) {
     return
 }
 
-# Every secret the monitor will need must exist now, not fail at 3 AM
+if ($WindowsCredential -and $NoStoredPassword) { throw 'Use either -WindowsCredential or -NoStoredPassword, not both.' }
+
+# Every secret the monitor will need must exist now, not fail at 3 AM.
+# A no-password task can only read the machine store, so check exactly that.
 Import-Module (Join-Path $PSScriptRoot '../AgHealth/AgHealth.psm1') -Force
 $needed = @($DetectSecret, $ControlSecret, $SlackSecret, $EmailSecret) | Where-Object { $_ }
-foreach ($name in $needed) { $null = Get-AgHealthSecret $name }
+foreach ($name in $needed) {
+    if ($NoStoredPassword) {
+        try { $null = Get-AgHealthSecret $name -Scope Machine }
+        catch { throw "Secret '$name' is not in the machine store, which a -NoStoredPassword task needs. Copy it with: Save-AgHealthSecret -Name $name -Credential (Get-AgHealthSecret $name -Scope User) -Scope Machine" }
+    }
+    else { $null = Get-AgHealthSecret $name }
+}
 if ($EmailSecret -and -not $EmailTo) { throw '-EmailTo is required with -EmailSecret.' }
 
 # Configuration: names of secrets only, never their values
@@ -94,10 +107,15 @@ $cfg | ConvertTo-Json -Depth 5 | Set-Content -Path $cfgPath -Encoding utf8
 
 # The task: a plain pwsh -File launch, every N minutes, as you
 $runner = (Resolve-Path (Join-Path $PSScriptRoot 'Invoke-AgHealthMonitor.ps1')).Path
-$alias  = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\pwsh.exe'     # Store installs: the stable launcher path
-$pwsh   = if (Test-Path $alias) { $alias } else { (Get-Command pwsh -ErrorAction Stop).Source }
+# Prefer a normally installed PowerShell: Store (MSIX) apps can fail to start in a background task
+$msi    = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'
+$alias  = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\pwsh.exe'     # Store installs: the launcher path
+$pwsh   = if (Test-Path $msi) { $msi } elseif (Test-Path $alias) { $alias } else { (Get-Command pwsh -ErrorAction Stop).Source }
+if ($NoStoredPassword -and $pwsh -eq $alias) {
+    Write-Warning "PowerShell is the Microsoft Store version. If the task's Last Run Result shows an error, install the regular version (winget install --id Microsoft.PowerShell --source winget) and register again."
+}
 
-$hidden = if ($WindowsCredential) { '' } else { '-WindowStyle Hidden ' }
+$hidden = if ($WindowsCredential -or $NoStoredPassword) { '' } else { '-WindowStyle Hidden ' }
 $action    = New-ScheduledTaskAction -Execute $pwsh -WorkingDirectory (Split-Path $runner) -Argument (
                  "-NoProfile -NonInteractive $hidden-File `"$runner`" -ConfigPath `"$cfgPath`"")
 $trigger   = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
@@ -116,6 +134,10 @@ if ($WindowsCredential) {
     $register.User     = $me
     $register.Password = $WindowsCredential.GetNetworkCredential().Password
     $register.RunLevel = 'Limited'
+}
+elseif ($NoStoredPassword) {
+    # Background as you, with no password stored: no window, runs whether you are signed in or not
+    $register.Principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType S4U -RunLevel Limited
 }
 else {
     $register.Principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
