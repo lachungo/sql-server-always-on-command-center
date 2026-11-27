@@ -17,8 +17,19 @@
         reachable replica sees locally is still stored. Two primaries on CLUSTER_TYPE = NONE means split brain.
       - Suspension is taken from the secondary's own view: the primary cannot see SUSPEND_FROM_PARTNER.
 
+    Notifications
+      - Channels: Slack (one message per alert event: an incident queue) and email (one digest per run, for the DBAs).
+      - Events: Opened, Escalated (Warning -> Critical), Resolved. Downgrades are not announced.
+      - Every attempt is logged per alert, channel and event, so a failed channel is retried on the next run
+        and a channel that already succeeded is never sent the same event twice.
+      - Secrets (webhook URL, SMTP password) never live in the repo or the database: on Windows they are stored
+        with DPAPI under the current user's profile (Save-AgHealthSecret).
+
     Public functions
       Invoke-AgHealthCollection - take one snapshot and store it
+      Send-AgHealthNotification - announce new, escalated and resolved alerts on every channel
+      New-AgHealthSlackChannel, New-AgHealthEmailChannel, New-AgHealthTestChannel - channel definitions
+      Save-AgHealthSecret, Get-AgHealthSecret - per-user encrypted secrets (Windows)
 
     Author: Louis Achungo | SQL IT Tech Solutions
 #>
@@ -343,4 +354,461 @@ UPDATE aghealth.Snapshot SET Status = 'Failed', ErrorMessage = LEFT(@err, 4000),
 
 #endregion
 
-Export-ModuleMember -Function Invoke-AgHealthCollection
+#region Notifications ---------------------------------------------------------
+
+function Get-AgHealthEventStyle {
+    # Label, colour and Slack emoji for one event
+    param($AlertEvent)
+    switch ($true) {
+        ($AlertEvent.Event -eq 'Resolved')        { return @{ Label = 'RESOLVED'; Color = '#039855'; Tint = '#ecfdf3'; Emoji = ':large_green_circle:' } }
+        ($AlertEvent.Event -eq 'Escalated')       { return @{ Label = 'ESCALATED TO CRITICAL'; Color = '#d92d20'; Tint = '#fef3f2'; Emoji = ':red_circle:' } }
+        ($AlertEvent.Severity -eq 'Critical')     { return @{ Label = 'CRITICAL'; Color = '#d92d20'; Tint = '#fef3f2'; Emoji = ':red_circle:' } }
+        default                                   { return @{ Label = 'WARNING';  Color = '#dc6803'; Tint = '#fffaeb'; Emoji = ':large_orange_circle:' } }
+    }
+}
+
+function Get-AgHealthText {
+    # DBNull-safe string
+    param($Value)
+    if ($null -eq $Value -or $Value -is [DBNull]) { '' } else { [string]$Value }
+}
+
+function Get-AgHealthTitle {
+    # 'AsyncSecondaryNotMoving' -> 'Async secondary not moving'
+    param([string] $RuleName)
+    $words = $RuleName -creplace '(?<=[a-z])(?=[A-Z])', ' ' -split ' '
+    (@($words[0]) + @($words | Select-Object -Skip 1 | ForEach-Object { $_.ToLower() })) -join ' '
+}
+
+function Format-AgHealthDuration {
+    param([timespan] $Span)
+    if ($Span.TotalSeconds -lt 0)  { $Span = [timespan]::Zero }
+    if ($Span.TotalMinutes -lt 1)  { return '{0} s' -f [int]$Span.TotalSeconds }
+    if ($Span.TotalHours   -lt 1)  { return '{0} min' -f [int][Math]::Floor($Span.TotalMinutes) }
+    if ($Span.TotalDays    -lt 1)  { return '{0} h {1} min' -f [int][Math]::Floor($Span.TotalHours), $Span.Minutes }
+    '{0} d {1} h' -f [int][Math]::Floor($Span.TotalDays), $Span.Hours
+}
+
+function Format-AgHealthValue {
+    # A raw metric value as a person would say it: KB -> MB/GB, seconds -> duration, flags -> words
+    param([string] $Metric, $Value)
+    $v = Get-AgHealthText $Value
+    if ($v -eq '') { return '-' }
+    switch -Regex ($Metric) {
+        '^IsSuspended$' { return $(if ($v -in '1', 'True') { 'Suspended' } else { 'Moving' }) }
+        '^IsReachable$' { return $(if ($v -in '1', 'True') { 'Reachable' } else { 'Unreachable' }) }
+        'Kb(Sec)?$' {
+            $kb = [double]$v; $rate = $(if ($Metric -like '*Sec') { '/s' } else { '' })
+            if ($kb -ge 1048576) { return ('{0:0.#} GB' -f ($kb / 1048576)) + $rate }
+            if ($kb -ge 1024)    { return ('{0:0.#} MB' -f ($kb / 1024)) + $rate }
+            return ('{0:0} KB' -f $kb) + $rate
+        }
+        'Sec$'  { return Format-AgHealthDuration ([timespan]::FromSeconds([double]$v)) }
+        'Ms$'   { return '{0:0} ms' -f [double]$v }
+        default { return ($v -replace '_', ' ') }
+    }
+}
+
+function Get-AgHealthExpected {
+    # What "healthy" means for this rule, in words
+    param($AlertEvent)
+    if ((Get-AgHealthText $AlertEvent.Operator) -eq '<>') {
+        return Format-AgHealthValue $AlertEvent.Metric $AlertEvent.ExpectedValue
+    }
+    'Under {0} (critical over {1})' -f (Format-AgHealthValue $AlertEvent.Metric $AlertEvent.WarnThreshold),
+                                       (Format-AgHealthValue $AlertEvent.Metric $AlertEvent.CritThreshold)
+}
+
+function Get-AgHealthEventView {
+    # Everything a message shows about one event, already formatted. Slack and email render the same view.
+    param($AlertEvent, [datetime] $NowUtc = [datetime]::UtcNow)
+    $style    = Get-AgHealthEventStyle $AlertEvent
+    $first    = [datetime]$AlertEvent.FirstSeenAt
+    $resolved = $AlertEvent.Event -eq 'Resolved'
+    $ended    = if ($resolved -and -not ($AlertEvent.ResolvedAt -is [DBNull])) { [datetime]$AlertEvent.ResolvedAt } else { $NowUtc }
+    [pscustomobject]@{
+        Style    = $style
+        Title    = Get-AgHealthTitle $AlertEvent.RuleName
+        Rule     = Get-AgHealthText $AlertEvent.RuleName
+        Event    = Get-AgHealthText $AlertEvent.Event
+        Path     = @($AlertEvent.AgName, $AlertEvent.ReplicaServerName, $AlertEvent.DatabaseName |
+                     ForEach-Object { Get-AgHealthText $_ } | Where-Object { $_ })
+        Now      = Format-AgHealthValue $AlertEvent.Metric $AlertEvent.LastValue
+        Expected = Get-AgHealthExpected $AlertEvent
+        # Opened/escalated: how long it has been going on. Resolved: how long it lasted, and how bad it got.
+        Timing   = if ($resolved) { 'Was {0} for {1}' -f (Get-AgHealthText $AlertEvent.Severity).ToLower(), (Format-AgHealthDuration ($ended - $first)) }
+                   else           { '{0:HH:mm} UTC ({1} ago)' -f $first, (Format-AgHealthDuration ($NowUtc - $first)) }
+        Runbook  = if ($resolved) { '' } else { Get-AgHealthText $AlertEvent.Runbook }
+        AlertId  = $AlertEvent.AlertId
+        Rank     = if ($resolved) { 3 } elseif ($AlertEvent.Severity -eq 'Critical') { 1 } else { 2 }
+    }
+}
+
+function ConvertTo-AgHealthSlackMessage {
+    # One Slack message per event: a card with a severity colour bar
+    param($AlertEvent, $Brand = (Get-AgHealthDefaultBrand))
+    if (-not $Brand) { $Brand = Get-AgHealthDefaultBrand }
+    $v   = Get-AgHealthEventView $AlertEvent
+    $dot = [char]0x00B7
+    $where = ($v.Path | ForEach-Object { '`' + $_ + '`' }) -join ' / '
+    $blocks = [Collections.Generic.List[object]]::new()
+    $blocks.Add(@{ type = 'section'; text = @{ type = 'mrkdwn'
+                   text = "$($v.Style.Emoji)  *$($v.Style.Label)*  $dot  *$($v.Title)*`n$where" } })
+    $blocks.Add(@{ type = 'section'; fields = @(
+                   @{ type = 'mrkdwn'; text = "*Now*`n$($v.Now)" }
+                   @{ type = 'mrkdwn'; text = "*Expected*`n$($v.Expected)" }
+                   @{ type = 'mrkdwn'; text = "*$(if ($v.Event -eq 'Resolved') { 'Duration' } else { 'Started' })*`n$($v.Timing)" }
+                   @{ type = 'mrkdwn'; text = "*Event*`n$($v.Event)" }) })
+    if ($v.Runbook) {
+        $blocks.Add(@{ type = 'section'; text = @{ type = 'mrkdwn'; text = "*What to check*`n$($v.Runbook)" } })
+    }
+    $blocks.Add(@{ type = 'context'; elements = @(@{ type = 'mrkdwn'
+                   text = ((@($Brand.Name, $Brand.Product) | Where-Object { $_ }) -join "  $dot  ") +
+                          "  $dot  Alert #$($v.AlertId)  $dot  rule ``$($v.Rule)``" }) })
+    @{
+        text        = "$($v.Style.Label): $($v.Title) on $($v.Path -join ' / ')"     # notification preview
+        attachments = @(@{ color = $v.Style.Color; blocks = $blocks.ToArray() })
+    } | ConvertTo-Json -Depth 10 -Compress
+}
+
+function ConvertTo-AgHealthEmail {
+    # One branded HTML digest per run. Inline styles and tables only: what Gmail and Outlook render reliably.
+    param([object[]] $Events, $Brand = (Get-AgHealthDefaultBrand), [datetime] $NowUtc = [datetime]::UtcNow)
+    if (-not $Brand) { $Brand = Get-AgHealthDefaultBrand }       # channels made before branding existed
+    $enc   = { param($x) [Net.WebUtility]::HtmlEncode([string]$x) }
+    $dot   = '&nbsp;&middot;&nbsp;'
+    $views = @($Events | ForEach-Object { Get-AgHealthEventView $_ $NowUtc } | Sort-Object Rank, Title)
+    $ags   = (@($Events | ForEach-Object { Get-AgHealthText $_.AgName }) | Sort-Object -Unique) -join ', '
+
+    $crit = @($views | Where-Object Rank -eq 1).Count
+    $warn = @($views | Where-Object Rank -eq 2).Count
+    $res  = @($views | Where-Object Rank -eq 3).Count
+    $parts = @()
+    if ($crit) { $parts += "$crit Critical" }
+    if ($warn) { $parts += "$warn Warning$(if ($warn -gt 1) { 's' })" }
+    if ($res)  { $parts += "$res Resolved" }
+    $summary = $parts -join ', '
+    $subject = "[AG $ags] $summary"
+
+    $pill = {
+        param($n, $label, $color, $tint)
+        "<td style='padding:0 6px 0 0'><span style='display:inline-block;padding:4px 10px;border-radius:999px;background:$tint;color:$color;font-size:12px;font-weight:600'>$n $label</span></td>"
+    }
+    $pills = @()
+    if ($crit) { $pills += & $pill $crit 'Critical' '#d92d20' '#fef3f2' }
+    if ($warn) { $pills += & $pill $warn $(if ($warn -gt 1) { 'Warnings' } else { 'Warning' }) '#dc6803' '#fffaeb' }
+    if ($res)  { $pills += & $pill $res 'Resolved' '#039855' '#ecfdf3' }
+
+    $cards = foreach ($v in $views) {
+        $runbook = if ($v.Runbook) {
+@"
+<tr><td colspan='3' style='padding:12px 0 0 0'><div style='background:#f9fafb;border-radius:6px;padding:10px 12px;font-size:13px;color:#344054'>
+<b style='color:#101828'>What to check</b><br>$(& $enc $v.Runbook)</div></td></tr>
+"@ } else { '' }
+@"
+<tr><td style='padding:0 28px 14px 28px'>
+<table width='100%' cellpadding='0' cellspacing='0' style='border:1px solid #eaecf0;border-left:4px solid $($v.Style.Color);border-radius:8px'>
+<tr><td style='padding:16px 18px'>
+  <span style='display:inline-block;padding:2px 8px;border-radius:4px;background:$($v.Style.Color);color:#ffffff;font-size:11px;font-weight:700;letter-spacing:.4px'>$(& $enc $v.Style.Label)</span>
+  <div style='font-size:16px;font-weight:600;color:#101828;margin-top:8px'>$(& $enc $v.Title)</div>
+  <div style='font-family:Consolas,Menlo,monospace;font-size:12px;color:#667085;margin-top:2px'>$(& $enc ($v.Path -join ' / '))</div>
+  <table width='100%' cellpadding='0' cellspacing='0' style='margin-top:12px;font-size:13px'>
+  <tr>
+    <td width='33%' valign='top'><div style='color:#667085;font-size:11px;text-transform:uppercase;letter-spacing:.5px'>Now</div><div style='color:#101828;font-weight:600'>$(& $enc $v.Now)</div></td>
+    <td width='34%' valign='top'><div style='color:#667085;font-size:11px;text-transform:uppercase;letter-spacing:.5px'>Expected</div><div style='color:#101828'>$(& $enc $v.Expected)</div></td>
+    <td width='33%' valign='top'><div style='color:#667085;font-size:11px;text-transform:uppercase;letter-spacing:.5px'>$(if ($v.Rank -eq 3) { 'Duration' } else { 'Started' })</div><div style='color:#101828'>$(& $enc $v.Timing)</div></td>
+  </tr>
+  $runbook
+  </table>
+</td></tr></table>
+</td></tr>
+"@
+    }
+
+    # Header: logo and company on the left, the AG and time on the right
+    $logo = if ($Brand.LogoPath) { "<td valign='middle' style='padding-right:12px'><img src='cid:brandlogo' height='40' alt='' style='display:block;height:40px;border:0'></td>" } else { '' }
+    $company = if ($Brand.Name) { "<div style='color:#ffffff;font-size:17px;font-weight:700;letter-spacing:.2px'>$(& $enc $Brand.Name)</div>" } else { '' }
+    $product = "<div style='color:$($Brand.AccentColor);font-size:11px;font-weight:700;letter-spacing:1.5px;margin-top:2px'>$(& $enc $Brand.Product.ToUpper())</div>"
+
+    # Footer: who sent it, how to reach them, and what generated it
+    $line1 = (@(
+        $(if ($Brand.Name)    { "<b style='color:#344054'>$(& $enc $Brand.Name)</b>" })
+        $(if ($Brand.Tagline) { "<i>$(& $enc $Brand.Tagline)</i>" })) | Where-Object { $_ }) -join $dot
+    $line2 = (@(
+        $(if ($Brand.Url)     { "<a href='$(& $enc $Brand.Url)' style='color:#475467;text-decoration:none'>$(& $enc ($Brand.Url -replace '^https?://', ''))</a>" })
+        $(if ($Brand.Contact) { "<a href='mailto:$(& $enc $Brand.Contact)' style='color:#475467;text-decoration:none'>$(& $enc $Brand.Contact)</a>" })) | Where-Object { $_ }) -join $dot
+    $footer = (@($line1, $line2) | Where-Object { $_ } | ForEach-Object { "<div style='margin-bottom:4px'>$_</div>" }) -join ''
+
+    $body = @"
+<!DOCTYPE html><html><body style='margin:0;padding:0;background:#f2f4f7'>
+<div style='display:none;max-height:0;overflow:hidden'>$(& $enc "$summary on $ags")</div>
+<table width='100%' cellpadding='0' cellspacing='0' style='background:#f2f4f7'><tr><td align='center' style='padding:28px 12px'>
+<table width='640' cellpadding='0' cellspacing='0' style='max-width:640px;background:#ffffff;border-radius:12px;overflow:hidden;font-family:Segoe UI,Helvetica,Arial,sans-serif'>
+<tr><td style='background:#0b1220;padding:20px 28px'>
+  <table width='100%' cellpadding='0' cellspacing='0'><tr>
+    <td valign='middle'><table cellpadding='0' cellspacing='0'><tr>$logo<td valign='middle'>$company$product</td></tr></table></td>
+    <td align='right' valign='middle' style='color:#98a2b3;font-size:12px;line-height:1.5'>
+      <div style='color:#ffffff;font-family:Consolas,Menlo,monospace;font-size:13px'>$(& $enc $ags)</div>
+      $(& $enc ('{0:ddd d MMM yyyy, HH:mm} UTC' -f $NowUtc))
+    </td>
+  </tr></table>
+</td></tr>
+<tr><td style='padding:22px 28px 6px 28px'>
+  <div style='font-size:19px;font-weight:600;color:#101828'>$(& $enc $summary)</div>
+  <div style='font-size:13px;color:#667085;margin-top:2px'>Availability Group health alerts for $(& $enc $ags)</div>
+</td></tr>
+<tr><td style='padding:12px 28px 16px 28px'><table cellpadding='0' cellspacing='0'><tr>$($pills -join '')</tr></table></td></tr>
+$($cards -join "`n")
+<tr><td style='padding:8px 28px 0 28px'><div style='border-top:1px solid #eaecf0'></div></td></tr>
+<tr><td style='padding:14px 28px 24px 28px;color:#667085;font-size:12px;line-height:1.5'>
+  $footer
+  <div style='color:#98a2b3;font-size:11px;margin-top:8px'>Generated by $(& $enc $Brand.Product) on $(& $enc $(if ($Brand.SourceName) { $Brand.SourceName } else { [Environment]::MachineName })).
+  An alert opens only after its rule breaches on consecutive snapshots, and resolves only when the replica is measured healthy again.</div>
+</td></tr>
+</table></td></tr></table></body></html>
+"@
+    @{ Subject = $subject; Body = $body }
+}
+
+function New-AgHealthBrand {
+    <#
+    .SYNOPSIS
+        Company branding for notifications: who the alerts come from, and how they look.
+    .EXAMPLE
+        $brand = New-AgHealthBrand -Name 'SQL-IT-Tech Solutions' -Tagline 'Enterprise SQL Architecture. Simplified.' `
+                                   -Url https://sql-it-techsolutions.com -Contact info@sql-it-techsolutions.com `
+                                   -SourceName SQL-IT-TECHSOLUTIONS `
+                                   -LogoPath C:\Labs\AgSync\brand\logo.png
+    #>
+    param([string] $Name,                                  # company name, shown above the product name
+          [string] $Product = 'Always On Command Center',
+          [string] $Tagline,
+          [string] $Url,
+          [string] $Contact,                               # support or on-call address shown in the footer
+          [string] $LogoPath,                              # PNG or JPG, embedded in the email (not linked)
+          [string] $SourceName,                            # shown as "Generated by ... on <SourceName>"; default: this computer's name
+          [ValidatePattern('^#[0-9a-fA-F]{6}$')] [string] $AccentColor = '#7dd3fc')
+    if ($LogoPath -and -not (Test-Path $LogoPath)) { throw "Logo not found: $LogoPath" }
+    [pscustomobject]@{ PSTypeName = 'AgHealth.Brand'; Name = $Name; Product = $Product; Tagline = $Tagline
+                       Url = $Url; Contact = $Contact; LogoPath = $LogoPath; AccentColor = $AccentColor
+                       SourceName = if ($SourceName) { $SourceName } else { [Environment]::MachineName } }
+}
+
+function Get-AgHealthDefaultBrand { New-AgHealthBrand }
+
+function New-AgHealthSlackChannel {
+    <#
+    .SYNOPSIS
+        A Slack incoming-webhook channel: one message per alert event.
+    .EXAMPLE
+        New-AgHealthSlackChannel -WebhookCredential (Get-AgHealthSecret SlackWebhook)
+    #>
+    param([Parameter(Mandatory)] [pscredential] $WebhookCredential,    # the webhook URL is the password
+          [string] $Name = 'Slack',
+          [object] $Brand = (Get-AgHealthDefaultBrand))
+    [pscustomobject]@{ PSTypeName = 'AgHealth.Channel'; Name = $Name; Kind = 'Slack'; Mode = 'PerEvent'
+                       Webhook = $WebhookCredential.Password; Brand = $Brand }
+}
+
+function New-AgHealthEmailChannel {
+    <#
+    .SYNOPSIS
+        An SMTP email channel: one digest per run. Defaults suit Gmail with an app password.
+    .EXAMPLE
+        # Gmail
+        New-AgHealthEmailChannel -Credential (Get-AgHealthSecret Gmail) -To achungolm@gmail.com
+    .EXAMPLE
+        # Your own domain through an SMTP relay (Brevo): the login is the relay's, the sender is yours
+        New-AgHealthEmailChannel -Credential (Get-AgHealthSecret Brevo) -SmtpServer smtp-relay.brevo.com `
+            -From alerts@sql-it-techsolutions.com -ReplyTo achungolm@gmail.com -To achungolm@gmail.com
+    #>
+    param([Parameter(Mandatory)] [pscredential] $Credential,
+          [Parameter(Mandatory)] [string[]] $To,
+          [string] $From,                                   # defaults to the credential's user name
+          [string] $FromName,                               # what the inbox shows; default: brand name, else product
+          [string] $ReplyTo,                                # where a DBA's reply goes
+          [string] $SmtpServer = 'smtp.gmail.com',
+          [int]    $Port = 587,
+          [string] $Name = 'Email',
+          [object] $Brand = (Get-AgHealthDefaultBrand))
+    [pscustomobject]@{ PSTypeName = 'AgHealth.Channel'; Name = $Name; Kind = 'Email'; Mode = 'Digest'
+                       Credential = $Credential; To = $To; SmtpServer = $SmtpServer; Port = $Port
+                       From = if ($From) { $From } else { $Credential.UserName }
+                       FromName = if ($FromName) { $FromName } elseif ($Brand.Name) { $Brand.Name } else { $Brand.Product }
+                       ReplyTo = $ReplyTo; Brand = $Brand }
+}
+
+function New-AgHealthTestChannel {
+    <#
+    .SYNOPSIS
+        An in-memory channel for tests and previews: records what it was sent and how Slack and email
+        would have rendered it, or fails on demand.
+    #>
+    param([string] $Name = 'Test', [ValidateSet('PerEvent', 'Digest')] [string] $Mode = 'PerEvent',
+          [string] $FailWith, [object] $Brand = (Get-AgHealthDefaultBrand))
+    [pscustomobject]@{ PSTypeName = 'AgHealth.Channel'; Name = $Name; Kind = 'Test'; Mode = $Mode; Brand = $Brand
+                       FailWith = $FailWith; Sent = [Collections.Generic.List[object]]::new()
+                       # What Slack and email would have received: { Slack = <json per event>; Email = @{Subject; Body} }
+                       Rendered = [Collections.Generic.List[object]]::new() }
+}
+
+function Send-AgHealthChannelMessage {
+    # Delivers one event (PerEvent) or a batch (Digest) on one channel. Throws on failure.
+    param($Channel, [object[]] $Events)
+    switch ($Channel.Kind) {
+        'Slack' {
+            $uri = [Net.NetworkCredential]::new('', $Channel.Webhook).Password
+            $null = Invoke-RestMethod -Uri $uri -Method Post -ContentType 'application/json; charset=utf-8' `
+                                      -Body ([Text.Encoding]::UTF8.GetBytes((ConvertTo-AgHealthSlackMessage $Events[0] $Channel.Brand)))
+        }
+        'Email' {
+            $mail   = ConvertTo-AgHealthEmail $Events $Channel.Brand
+            $client = [Net.Mail.SmtpClient]::new($Channel.SmtpServer, $Channel.Port)
+            $msg    = [Net.Mail.MailMessage]::new()
+            $msg.From    = [Net.Mail.MailAddress]::new($Channel.From, $Channel.FromName)
+            foreach ($t in $Channel.To) { $msg.To.Add($t) }
+            if ($Channel.ReplyTo) { $msg.ReplyToList.Add($Channel.ReplyTo) }
+            $msg.Subject = $mail.Subject
+            if ($Channel.Brand.LogoPath) {
+                # The logo travels inside the email (cid:), so it shows without "load images" and offline
+                $view = [Net.Mail.AlternateView]::CreateAlternateViewFromString($mail.Body, [Text.Encoding]::UTF8, 'text/html')
+                $mime = if ($Channel.Brand.LogoPath -match '\.jpe?g$') { 'image/jpeg' } else { 'image/png' }
+                $logo = [Net.Mail.LinkedResource]::new($Channel.Brand.LogoPath, $mime)
+                $logo.ContentId = 'brandlogo'
+                $view.LinkedResources.Add($logo)
+                $msg.AlternateViews.Add($view)
+            }
+            else { $msg.Body = $mail.Body }
+            try {
+                $client.EnableSsl      = $true
+                $client.Credentials    = $Channel.Credential.GetNetworkCredential()
+                $msg.IsBodyHtml        = $true
+                $msg.SubjectEncoding   = [Text.Encoding]::UTF8
+                $msg.BodyEncoding      = [Text.Encoding]::UTF8
+                $client.Send($msg)
+            }
+            finally { $msg.Dispose(); $client.Dispose() }
+        }
+        'Test' {
+            if ($Channel.FailWith) { throw $Channel.FailWith }
+            $Channel.Rendered.Add([pscustomobject]@{
+                Slack = @($Events | ForEach-Object { ConvertTo-AgHealthSlackMessage $_ $Channel.Brand })
+                Email = ConvertTo-AgHealthEmail $Events $Channel.Brand })
+            $Channel.Sent.Add($Events)
+        }
+        default { throw "Unknown channel kind '$($Channel.Kind)'." }
+    }
+}
+
+function Send-AgHealthNotification {
+    <#
+    .SYNOPSIS
+        Announces new, escalated and resolved alerts on every channel, exactly once per channel.
+    .DESCRIPTION
+        Reads aghealth.PendingNotification. For each channel, sends only the events that channel has not
+        already delivered; logs every attempt; marks an event done once every channel has it.
+        A failed channel is retried on the next run. Returns one row per event and channel.
+    .EXAMPLE
+        $slack = New-AgHealthSlackChannel -WebhookCredential (Get-AgHealthSecret SlackWebhook)
+        $email = New-AgHealthEmailChannel -Credential (Get-AgHealthSecret Gmail) -To achungolm@gmail.com
+        Send-AgHealthNotification -ControlInstance localhost,14340 -ControlCredential $ctlCred -Channel $slack, $email
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $ControlInstance,
+        [string] $ControlDatabase = 'AgSyncControl',
+        [pscredential] $ControlCredential,
+        [Parameter(Mandatory)] [object[]] $Channel,
+        [string] $AgName                                     # optional: only this AG
+    )
+    $control = @{ SqlInstance = $ControlInstance; Database = $ControlDatabase }
+    if ($ControlCredential) { $control.SqlCredential = $ControlCredential }
+
+    if (@($Channel | Where-Object { $null -eq $_ -or $_.PSObject.TypeNames -notcontains 'AgHealth.Channel' }).Count) {
+        throw 'Every -Channel must come from New-AgHealthSlackChannel, New-AgHealthEmailChannel or New-AgHealthTestChannel (one was empty or not a channel).'
+    }
+    $names = @($Channel.Name)
+    if (($names | Sort-Object -Unique).Count -ne $names.Count) { throw 'Channel names must be unique.' }
+
+    $query = 'SELECT * FROM aghealth.PendingNotification' + $(if ($AgName) { ' WHERE AgName = @ag' }) + ' ORDER BY AlertId;'
+    $pending = @(Invoke-DbaQuery @control -EnableException -Query $query -SqlParameter @{ ag = "$AgName" })
+    if (-not $pending.Count) { return }
+
+    # What each channel has already delivered, so a retry never duplicates
+    $ids  = ($pending.AlertId | ForEach-Object { [long]$_ }) -join ','
+    $done = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($n in Invoke-DbaQuery @control -EnableException -Query @"
+SELECT AlertId, Channel, EventKey FROM aghealth.Notification WHERE Status = 'Sent' AND AlertId IN ($ids);
+"@) { $null = $done.Add("$($n.AlertId)|$($n.Channel)|$($n.EventKey)") }
+
+    $record = {
+        param($AlertEvent, $Ch, [string] $Status, [string] $ErrorText)
+        $err = if ($ErrorText) { $ErrorText.Substring(0, [Math]::Min(1000, $ErrorText.Length)) } else { [DBNull]::Value }
+        Invoke-DbaQuery @control -EnableException -Query 'EXEC aghealth.usp_RecordNotification @a, @c, @k, @s, @e;' `
+                        -SqlParameter @{ a = $AlertEvent.AlertId; c = $Ch.Name; k = $AlertEvent.EventKey; s = $Status; e = $err }
+        [pscustomobject]@{ PSTypeName = 'AgHealth.Notification'; AlertId = $AlertEvent.AlertId; RuleName = $AlertEvent.RuleName
+                           Event = $AlertEvent.Event; Severity = $AlertEvent.Severity; Channel = $Ch.Name; Status = $Status
+                           Error = $ErrorText }
+    }
+
+    foreach ($ch in $Channel) {
+        $todo = @($pending | Where-Object { -not $done.Contains("$($_.AlertId)|$($ch.Name)|$($_.EventKey)") })
+        if (-not $todo.Count) { continue }
+
+        if ($ch.Mode -eq 'Digest') {
+            $errorText = $null
+            try { Send-AgHealthChannelMessage $ch $todo } catch { $errorText = $_.Exception.Message }
+            foreach ($e in $todo) { & $record $e $ch $(if ($errorText) { 'Failed' } else { 'Sent' }) $errorText }
+        }
+        else {
+            foreach ($e in $todo) {
+                $errorText = $null
+                try { Send-AgHealthChannelMessage $ch @($e) } catch { $errorText = $_.Exception.Message }
+                & $record $e $ch $(if ($errorText) { 'Failed' } else { 'Sent' }) $errorText
+            }
+        }
+    }
+
+    # An event is done when every channel has delivered it (now or on an earlier run)
+    $json = ConvertTo-Json -InputObject $names -Compress
+    foreach ($e in $pending) {
+        $null = Invoke-DbaQuery @control -EnableException -Query 'EXEC aghealth.usp_CompleteNotification @a, @k, @c;' `
+                                -SqlParameter @{ a = $e.AlertId; k = $e.EventKey; c = $json }
+    }
+}
+
+function Get-AgHealthSecretPath {
+    param([string] $Name)
+    if (-not $IsWindows -and $PSVersionTable.PSEdition -eq 'Core') {
+        throw 'Saved secrets use Windows DPAPI. On other platforms, pass credentials directly.'
+    }
+    Join-Path $env:LOCALAPPDATA "AlwaysOnCommandCenter\secrets\$Name.xml"
+}
+
+function Save-AgHealthSecret {
+    <#
+    .SYNOPSIS
+        Stores a credential encrypted for the current Windows user (DPAPI), outside the repo.
+    .EXAMPLE
+        Save-AgHealthSecret -Name Gmail -Credential (Get-Credential achungolm@gmail.com)
+    #>
+    param([Parameter(Mandatory)] [ValidatePattern('^[A-Za-z0-9_-]+$')] [string] $Name,
+          [Parameter(Mandatory)] [pscredential] $Credential)
+    $path = Get-AgHealthSecretPath $Name
+    $null = New-Item -ItemType Directory -Path (Split-Path $path) -Force
+    $Credential | Export-Clixml -Path $path -Force
+    Write-Verbose "Saved $Name to $path (readable only by $env:USERNAME on $env:COMPUTERNAME)."
+}
+
+function Get-AgHealthSecret {
+    param([Parameter(Mandatory)] [string] $Name)
+    $path = Get-AgHealthSecretPath $Name
+    if (-not (Test-Path $path)) { throw "Secret '$Name' not found. Save it first with Save-AgHealthSecret." }
+    Import-Clixml -Path $path
+}
+
+#endregion
+
+Export-ModuleMember -Function Invoke-AgHealthCollection, Send-AgHealthNotification, New-AgHealthBrand,
+                              New-AgHealthSlackChannel, New-AgHealthEmailChannel, New-AgHealthTestChannel,
+                              Save-AgHealthSecret, Get-AgHealthSecret

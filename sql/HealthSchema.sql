@@ -119,6 +119,29 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Alert_State_LastSeen')
 CREATE INDEX IX_Alert_State_LastSeen ON aghealth.Alert (State, LastSeenAt DESC) INCLUDE (Severity, AgName);
 GO
 
+-- Resolution notices are tracked separately from the open/escalation notice
+IF COL_LENGTH('aghealth.Alert', 'ResolvedNotifiedAt') IS NULL
+    ALTER TABLE aghealth.Alert ADD ResolvedNotifiedAt datetime2(3) NULL;
+GO
+
+-- Notification log, one row per alert, channel and event. It is what makes delivery safe to retry:
+-- if Slack succeeded and email failed, the next run retries email only, and Slack never gets a duplicate.
+--   EventKey: Open:Warning | Open:Critical | Resolved
+IF OBJECT_ID('aghealth.Notification') IS NULL
+CREATE TABLE aghealth.Notification (
+    NotificationId bigint IDENTITY CONSTRAINT PK_Notification PRIMARY KEY,
+    AlertId        bigint         NOT NULL CONSTRAINT FK_Notification_Alert REFERENCES aghealth.Alert(AlertId) ON DELETE CASCADE,
+    Channel        varchar(30)    NOT NULL,
+    EventKey       varchar(20)    NOT NULL,
+    Status         varchar(10)    NOT NULL,             -- Sent | Failed
+    Attempts       int            NOT NULL CONSTRAINT DF_Notification_Attempts DEFAULT 1,
+    FirstAttemptAt datetime2(3)   NOT NULL CONSTRAINT DF_Notification_First DEFAULT SYSUTCDATETIME(),
+    LastAttemptAt  datetime2(3)   NOT NULL CONSTRAINT DF_Notification_Last  DEFAULT SYSUTCDATETIME(),
+    LastError      nvarchar(1000) NULL,
+    CONSTRAINT UQ_Notification UNIQUE (AlertId, Channel, EventKey),
+    CONSTRAINT CK_Notification_Status CHECK (Status IN ('Sent','Failed')));
+GO
+
 -- Default rules. Inserted only if missing, so tuned thresholds survive a re-run.
 INSERT aghealth.AlertRule (RuleName, Scope, Metric, Operator, WarnThreshold, CritThreshold, ExpectedValue, Severity, AppliesTo, ConsecutiveSnapshots, Description)
 SELECT v.RuleName, v.Scope, v.Metric, v.Op, v.Warn, v.Crit, v.Expected, v.Sev, v.AppliesTo, v.Consec, v.Descr
@@ -136,6 +159,28 @@ FROM (VALUES
     ('EstimatedRecoveryHigh',     'Database', 'EstimatedRecoverySec',  '>',  300,     900,     NULL,            NULL,       'All',          3, N'Seconds to redo the queue before the database can come online (RTO)')
 ) v(RuleName, Scope, Metric, Op, Warn, Crit, Expected, Sev, AppliesTo, Consec, Descr)
 WHERE NOT EXISTS (SELECT 1 FROM aghealth.AlertRule r WHERE r.RuleName = v.RuleName);
+GO
+
+-- What to check: a short runbook hint per rule, shown in every notification. Data, like the thresholds.
+IF COL_LENGTH('aghealth.AlertRule', 'Runbook') IS NULL
+    ALTER TABLE aghealth.AlertRule ADD Runbook nvarchar(400) NULL;
+GO
+UPDATE r SET Runbook = v.Runbook
+FROM aghealth.AlertRule r
+JOIN (VALUES
+    ('CollectionFailed',        N'Check that the collector can reach every replica and the controller. The reason is in aghealth.Snapshot.ErrorMessage.'),
+    ('ReplicaUnreachable',      N'Confirm the SQL Server service is running on the replica and its port is reachable from the collector.'),
+    ('ReplicaDisconnected',     N'Check the HADR endpoint is STARTED on both replicas (sys.database_mirroring_endpoints), the certificates are valid and port 5022 is open.'),
+    ('ReplicaNotHealthy',       N'Health rolls up from the replica''s databases: start with the database alerts for this replica.'),
+    ('DatabaseSuspended',       N'Read suspend_reason_desc in sys.dm_hadr_database_replica_states on the secondary, fix the cause, then run ALTER DATABASE ... SET HADR RESUME on the secondary.'),
+    ('SyncSecondaryNotSynced',  N'A lossless failover to this replica is not possible right now. Check its send and redo queues and the network between replicas.'),
+    ('AsyncSecondaryNotMoving', N'The DR copy is falling behind. Check the replica is connected and not suspended.'),
+    ('LogSendQueueHigh',        N'Log is not leaving the primary fast enough: check network throughput to the secondary, and large transactions or index maintenance on the primary.'),
+    ('RedoQueueHigh',           N'The secondary is not redoing fast enough: check its I/O and CPU, and read-only queries blocking the redo thread.'),
+    ('EstimatedDataLossHigh',   N'This much committed work would be lost if the primary failed now. Check the send queue and the network to the DR replica.'),
+    ('EstimatedRecoveryHigh',   N'A failover to this replica would take this long before its databases come online. Check the redo queue and the secondary''s I/O.')
+) v(RuleName, Runbook) ON v.RuleName = r.RuleName
+WHERE r.Runbook IS NULL;
 GO
 
 -- Retention. Deleting snapshots cascades to replica and database state.
@@ -323,12 +368,77 @@ BEGIN
 END;
 GO
 
+-- What still has to be announced:
+--   an open alert whose current severity has not been announced (new, or escalated), and
+--   a resolved alert that was announced as open but whose resolution has not been.
+-- An alert that opened and resolved between two notifier runs is never announced at all.
+CREATE OR ALTER VIEW aghealth.PendingNotification
+AS
+SELECT a.AlertId, a.AgName, a.ReplicaServerName, a.DatabaseName, a.Severity, a.State, r.RuleName,
+       a.LastValue, a.Message, a.FirstSeenAt, a.LastSeenAt, a.ResolvedAt,
+       r.Metric, r.Operator, r.ExpectedValue, r.WarnThreshold, r.CritThreshold, r.Description, r.Runbook,
+       CASE WHEN a.State = 'Open' THEN 'Open:' + a.Severity ELSE 'Resolved' END AS EventKey,
+       CASE WHEN a.State = 'Resolved' THEN 'Resolved'
+            WHEN EXISTS (SELECT 1 FROM aghealth.Notification n WHERE n.AlertId = a.AlertId AND n.Status = 'Sent')
+                 THEN 'Escalated'
+            ELSE 'Opened' END AS Event
+FROM aghealth.Alert a
+JOIN aghealth.AlertRule r ON r.RuleId = a.RuleId
+WHERE (a.State = 'Open'     AND a.NotifiedAt IS NULL)
+   OR (a.State = 'Resolved' AND a.NotifiedAt IS NOT NULL AND a.ResolvedNotifiedAt IS NULL);
+GO
+
+-- Records one delivery attempt (insert the first time, count retries after that)
+CREATE OR ALTER PROCEDURE aghealth.usp_RecordNotification
+    @AlertId  bigint,
+    @Channel  varchar(30),
+    @EventKey varchar(20),
+    @Status   varchar(10),
+    @Error    nvarchar(1000) = NULL
+AS
+BEGIN
+    SET NOCOUNT, XACT_ABORT ON;
+    BEGIN TRAN;
+    UPDATE aghealth.Notification WITH (UPDLOCK, HOLDLOCK)
+    SET Status = @Status, Attempts = Attempts + 1, LastAttemptAt = SYSUTCDATETIME(), LastError = @Error
+    WHERE AlertId = @AlertId AND Channel = @Channel AND EventKey = @EventKey;
+    IF @@ROWCOUNT = 0
+        INSERT aghealth.Notification (AlertId, Channel, EventKey, Status, LastError)
+        VALUES (@AlertId, @Channel, @EventKey, @Status, @Error);
+    COMMIT;
+END;
+GO
+
+-- Marks an event announced once every channel has it. Returns 1 if the alert is now fully announced.
+CREATE OR ALTER PROCEDURE aghealth.usp_CompleteNotification
+    @AlertId  bigint,
+    @EventKey varchar(20),
+    @Channels nvarchar(max)          -- JSON array of the channel names in use, e.g. ["Slack","Email"]
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @needed int = (SELECT COUNT(*) FROM OPENJSON(@Channels));
+    DECLARE @sent int = (SELECT COUNT(*) FROM aghealth.Notification n
+                         WHERE n.AlertId = @AlertId AND n.EventKey = @EventKey AND n.Status = 'Sent'
+                           AND n.Channel IN (SELECT value FROM OPENJSON(@Channels)));
+    IF @sent < @needed BEGIN SELECT CAST(0 AS bit) AS Completed; RETURN; END;
+
+    UPDATE aghealth.Alert
+    SET NotifiedAt         = CASE WHEN @EventKey <> 'Resolved' THEN SYSUTCDATETIME() ELSE NotifiedAt END,
+        ResolvedNotifiedAt = CASE WHEN @EventKey  = 'Resolved' THEN SYSUTCDATETIME() ELSE ResolvedNotifiedAt END
+    WHERE AlertId = @AlertId;
+    SELECT CAST(1 AS bit) AS Completed;
+END;
+GO
+
 -- Roles: the collector writes, the dashboard reads. Nothing else gets access to this schema.
 IF DATABASE_PRINCIPAL_ID('aghealth_writer') IS NULL CREATE ROLE aghealth_writer;
 IF DATABASE_PRINCIPAL_ID('aghealth_reader') IS NULL CREATE ROLE aghealth_reader;
 GRANT SELECT, INSERT, UPDATE ON SCHEMA::aghealth TO aghealth_writer;
-GRANT EXECUTE ON aghealth.usp_PurgeHistory  TO aghealth_writer;
-GRANT EXECUTE ON aghealth.usp_EvaluateAlerts TO aghealth_writer;
+GRANT EXECUTE ON aghealth.usp_PurgeHistory         TO aghealth_writer;
+GRANT EXECUTE ON aghealth.usp_EvaluateAlerts       TO aghealth_writer;
+GRANT EXECUTE ON aghealth.usp_RecordNotification   TO aghealth_writer;
+GRANT EXECUTE ON aghealth.usp_CompleteNotification TO aghealth_writer;
 GRANT SELECT ON SCHEMA::aghealth TO aghealth_reader;
 
 -- The control account already used by AG Sync becomes the collector's writer

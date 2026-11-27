@@ -279,3 +279,127 @@ SELECT (SELECT COUNT(*) FROM aghealth.Snapshot      WHERE SnapshotId = @id) AS s
         (Invoke-Ctl "SELECT COUNT(*) AS c FROM aghealth.Snapshot WHERE SnapshotId = @id;" @{ id = $kept }).c | Should -Be 1
     }
 }
+
+Describe 'Notifications: exactly once per channel, retried when a channel fails' {
+    BeforeAll {
+        # A rule that always breaches, so this block controls its own alert from open to resolved
+        Invoke-Ctl @"
+INSERT aghealth.AlertRule (RuleName, Scope, Metric, Operator, WarnThreshold, CritThreshold, ConsecutiveSnapshots, Description)
+VALUES ('pt_Notify', 'Ag', 'DurationMs', '>', -2, 1000000, 1, N'Notification test rule');
+"@
+        $notify = @{ ControlInstance = $ControlInstance; AgName = $AgName }
+        if ($ControlCredential) { $notify.ControlCredential = $ControlCredential }
+
+        function Get-Mine {
+            # Events for the test rule only, from a channel's in-memory outbox.
+            # The leading comma returns the array as-is: PowerShell would otherwise unroll a single row,
+            # and [0] on a bare DataRow reads its first column instead of the first row.
+            param($Ch)
+            , @($Ch.Sent | ForEach-Object { $_ } | Where-Object RuleName -eq 'pt_Notify')
+        }
+        function Get-TestAlert {
+            Invoke-Ctl @"
+SELECT TOP (1) a.AlertId, a.State, a.Severity, a.NotifiedAt, a.ResolvedNotifiedAt
+FROM aghealth.Alert a JOIN aghealth.AlertRule r ON r.RuleId = a.RuleId
+WHERE r.RuleName = 'pt_Notify' ORDER BY a.AlertId DESC;
+"@
+        }
+
+        $null = Invoke-Collect                                              # alert opens (Warning)
+        $slack1 = New-AgHealthTestChannel -Name pt_Slack -Mode PerEvent
+        $email1 = New-AgHealthTestChannel -Name pt_Email -Mode Digest -FailWith 'SMTP is down'
+        $run1   = @(Send-AgHealthNotification @notify -Channel $slack1, $email1)
+    }
+    AfterAll {
+        Invoke-Ctl @"
+DELETE a FROM aghealth.Alert a JOIN aghealth.AlertRule r ON r.RuleId = a.RuleId WHERE r.RuleName = 'pt_Notify';
+DELETE aghealth.AlertRule WHERE RuleName = 'pt_Notify';
+"@
+    }
+
+    It 'announces a new alert as Opened on the channel that works' {
+        $e = Get-Mine $slack1
+        $e.Count    | Should -Be 1
+        $e[0].Event | Should -Be 'Opened'
+        ($run1 | Where-Object { $_.RuleName -eq 'pt_Notify' -and $_.Channel -eq 'pt_Slack' }).Status | Should -Be 'Sent'
+    }
+    It 'renders a real event as a Slack card with a severity colour bar' {
+        $msg = $slack1.Rendered[0].Slack[0] | ConvertFrom-Json
+        $msg.attachments[0].color          | Should -Be '#dc6803'          # warning
+        $msg.attachments[0].blocks[0].text.text | Should -Match 'WARNING'
+        $msg.attachments[0].blocks[0].text.text | Should -Match 'pt_Notify'
+        $msg.text                          | Should -Match "WARNING: pt_Notify on $AgName"
+    }
+    It 'logs the failed channel and keeps the alert pending' {
+        $f = $run1 | Where-Object { $_.RuleName -eq 'pt_Notify' -and $_.Channel -eq 'pt_Email' }
+        $f.Status | Should -Be 'Failed'
+        $f.Error  | Should -Be 'SMTP is down'
+        (Get-TestAlert).NotifiedAt | Should -BeOfType [DBNull]
+    }
+    It 'retries only the failed channel: no duplicate on the one that already succeeded' {
+        $slack2 = New-AgHealthTestChannel -Name pt_Slack -Mode PerEvent
+        $email2 = New-AgHealthTestChannel -Name pt_Email -Mode Digest
+        $null = Send-AgHealthNotification @notify -Channel $slack2, $email2
+        (Get-Mine $slack2).Count | Should -Be 0
+        (Get-Mine $email2).Count | Should -Be 1
+        (Get-TestAlert).NotifiedAt | Should -Not -BeOfType [DBNull]
+        (Invoke-Ctl @"
+SELECT n.Attempts FROM aghealth.Notification n
+WHERE n.AlertId = @id AND n.Channel = 'pt_Email' AND n.EventKey = 'Open:Warning';
+"@ @{ id = (Get-TestAlert).AlertId }).Attempts | Should -Be 2
+    }
+    It 'announces an escalation to Critical on every channel' {
+        Invoke-Ctl "UPDATE aghealth.AlertRule SET CritThreshold = -1 WHERE RuleName = 'pt_Notify';"
+        $null = Invoke-Collect
+        $slack3 = New-AgHealthTestChannel -Name pt_Slack -Mode PerEvent
+        $email3 = New-AgHealthTestChannel -Name pt_Email -Mode Digest
+        $null = Send-AgHealthNotification @notify -Channel $slack3, $email3
+        foreach ($ch in $slack3, $email3) {
+            $e = Get-Mine $ch
+            $e.Count       | Should -Be 1
+            $e[0].Event    | Should -Be 'Escalated'
+            $e[0].Severity | Should -Be 'Critical'
+        }
+    }
+    It 'announces the resolution on every channel, then has nothing left to send' {
+        Invoke-Ctl "UPDATE aghealth.AlertRule SET IsEnabled = 0 WHERE RuleName = 'pt_Notify';"
+        $null = Invoke-Collect
+        $slack4 = New-AgHealthTestChannel -Name pt_Slack -Mode PerEvent
+        $email4 = New-AgHealthTestChannel -Name pt_Email -Mode Digest
+        $null = Send-AgHealthNotification @notify -Channel $slack4, $email4
+        (Get-Mine $slack4)[0].Event | Should -Be 'Resolved'
+        (Get-Mine $email4)[0].Event | Should -Be 'Resolved'
+        (Get-TestAlert).ResolvedNotifiedAt | Should -Not -BeOfType [DBNull]
+
+        $slack5 = New-AgHealthTestChannel -Name pt_Slack -Mode PerEvent
+        $null = Send-AgHealthNotification @notify -Channel $slack5, (New-AgHealthTestChannel -Name pt_Email -Mode Digest)
+        (Get-Mine $slack5).Count | Should -Be 0
+    }
+
+    It 'renders every default rule for Slack and email (no rule breaks the formatter)' {
+        $rules  = Invoke-Ctl "SELECT RuleName, Metric, Operator, ExpectedValue, WarnThreshold, CritThreshold, Description, Runbook FROM aghealth.AlertRule WHERE RuleName NOT LIKE 'pt[_]%';"
+        $now    = [datetime]::UtcNow
+        $events = foreach ($r in $rules) {
+            [pscustomobject]@{ AlertId = 1; AgName = $AgName; ReplicaServerName = 'replica'; DatabaseName = 'db'
+                               Severity = 'Critical'; State = 'Open'; RuleName = $r.RuleName; LastValue = '5'; Message = 'm'
+                               FirstSeenAt = $now.AddMinutes(-3); LastSeenAt = $now; ResolvedAt = [DBNull]::Value
+                               Metric = $r.Metric; Operator = $r.Operator; ExpectedValue = $r.ExpectedValue
+                               WarnThreshold = $r.WarnThreshold; CritThreshold = $r.CritThreshold
+                               Description = $r.Description; Runbook = $r.Runbook; EventKey = 'Open:Critical'; Event = 'Opened' }
+        }
+        $brand   = New-AgHealthBrand -Name 'pt Brand' -Tagline 'pt tagline' -Url https://example.com -Contact ops@example.com
+        $preview = New-AgHealthTestChannel -Mode Digest -Brand $brand
+        InModuleScope -ModuleName AgHealth -Parameters @{ Ch = $preview; Ev = @($events) } -ScriptBlock {
+            param($Ch, $Ev) Send-AgHealthChannelMessage $Ch $Ev
+        }
+        $r = $preview.Rendered[0]
+        $r.Slack.Count | Should -Be 11
+        foreach ($json in $r.Slack) { @(($json | ConvertFrom-Json).attachments[0].blocks).Count | Should -BeGreaterThan 2 }
+        $r.Email.Subject | Should -Be "[AG $AgName] 11 Critical"
+        $r.Email.Body    | Should -Match 'What to check'
+        $r.Email.Body    | Should -Match '11 Critical'
+        $r.Email.Body    | Should -Match 'pt Brand'                   # company in the header and footer
+        $r.Email.Body    | Should -Match 'ops@example.com'
+        ($r.Slack[0] | ConvertFrom-Json).attachments[0].blocks[-1].elements[0].text | Should -Match 'pt Brand'
+    }
+}
