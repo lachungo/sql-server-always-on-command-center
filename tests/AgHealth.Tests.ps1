@@ -445,3 +445,52 @@ DELETE aghealth.AlertRule WHERE RuleName = 'pt_Outage';
         @($email3.Sent).Count | Should -Be 0
     }
 }
+
+Describe 'Monitor runner (the scheduled pass)' {
+    BeforeAll {
+        $tmp = Join-Path ([IO.Path]::GetTempPath()) ('aghealth-' + [guid]::NewGuid().ToString('N'))
+        $null = New-Item -ItemType Directory -Path $tmp
+        $cfgPath = Join-Path $tmp 'monitor.json'
+        # No channels in this config: the runner test must not consume the lab's real pending notifications
+        @{ Replica = @($Replica); AgName = $AgName; ControlInstance = $ControlInstance; TrustServerCertificate = $true } |
+            ConvertTo-Json | Set-Content -Path $cfgPath
+        $runner  = "$PSScriptRoot/../ops/Invoke-AgHealthMonitor.ps1"
+        $runArgs = @{ ConfigPath = $cfgPath; LogDirectory = $tmp; DetectCredential = $DetectCredential }
+        if ($ControlCredential) { $runArgs.ControlCredential = $ControlCredential }
+        function Get-MaxSnapshot { (Invoke-Ctl 'SELECT ISNULL(MAX(SnapshotId), 0) AS m FROM aghealth.Snapshot;').m }
+        function Get-RunLog { Get-Content -Path (Get-ChildItem $tmp -Filter 'monitor-*.log' | Select-Object -First 1).FullName }
+
+        $before = Get-MaxSnapshot
+        & $runner @runArgs
+        $firstExit = $LASTEXITCODE
+        $after = Get-MaxSnapshot
+    }
+    AfterAll { Remove-Item -Path $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+
+    It 'takes and stores a snapshot, and exits 0' {
+        $firstExit | Should -Be 0
+        $after     | Should -BeGreaterThan $before
+    }
+    It 'logs the run' {
+        (Get-RunLog) -join "`n" | Should -Match "${AgName}: snapshot \d+ Succeeded"
+    }
+    It 'skips instead of overlapping while a run is still active' {
+        $agTag = $AgName -replace '[^A-Za-z0-9_.-]', '_'
+        $held  = [IO.File]::Open((Join-Path $tmp "$agTag.lock"), 'OpenOrCreate', 'ReadWrite', 'None')
+        try {
+            $mark = Get-MaxSnapshot
+            & $runner @runArgs
+            $LASTEXITCODE        | Should -Be 0
+            Get-MaxSnapshot      | Should -Be $mark            # nothing collected
+            (Get-RunLog) -join "`n" | Should -Match 'still active; skipped'
+        }
+        finally { $held.Dispose() }
+    }
+    It 'reports a broken configuration with exit code 3' {
+        $bad = Join-Path $tmp 'bad.json'
+        @{ Replica = @($Replica) } | ConvertTo-Json | Set-Content -Path $bad
+        & $runner -ConfigPath $bad -LogDirectory $tmp
+        $LASTEXITCODE | Should -Be 3
+        (Get-RunLog) -join "`n" | Should -Match "'AgName' is missing"
+    }
+}
