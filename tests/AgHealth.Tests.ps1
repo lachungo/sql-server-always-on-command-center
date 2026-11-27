@@ -403,3 +403,45 @@ WHERE n.AlertId = @id AND n.Channel = 'pt_Email' AND n.EventKey = 'Open:Warning'
         ($r.Slack[0] | ConvertFrom-Json).attachments[0].blocks[-1].elements[0].text | Should -Match 'pt Brand'
     }
 }
+
+Describe 'Notifications: one broken channel never blocks or mislabels another' {
+    BeforeAll {
+        Invoke-Ctl @"
+INSERT aghealth.AlertRule (RuleName, Scope, Metric, Operator, WarnThreshold, CritThreshold, ConsecutiveSnapshots, Description)
+VALUES ('pt_Outage', 'Ag', 'DurationMs', '>', -2, 1000000, 1, N'Channel outage test rule');
+"@
+        $notify = @{ ControlInstance = $ControlInstance; AgName = $AgName }
+        if ($ControlCredential) { $notify.ControlCredential = $ControlCredential }
+        function Get-Outage { param($Rows) @($Rows | Where-Object RuleName -eq 'pt_Outage') }
+
+        $null = Invoke-Collect                                                     # opens
+        $run1 = Get-Outage (Send-AgHealthNotification @notify -Channel (New-AgHealthTestChannel -Name pt_Slack), (New-AgHealthTestChannel -Name pt_Email -Mode Digest -FailWith 'SMTP AUTH disabled'))
+        $run2 = Get-Outage (Send-AgHealthNotification @notify -Channel (New-AgHealthTestChannel -Name pt_Slack), (New-AgHealthTestChannel -Name pt_Email -Mode Digest -FailWith 'SMTP AUTH disabled'))
+
+        Invoke-Ctl "UPDATE aghealth.AlertRule SET IsEnabled = 0 WHERE RuleName = 'pt_Outage';"
+        $null = Invoke-Collect                                                     # resolves
+        $slack3 = New-AgHealthTestChannel -Name pt_Slack
+        $email3 = New-AgHealthTestChannel -Name pt_Email -Mode Digest              # email works again
+        $run3 = Get-Outage (Send-AgHealthNotification @notify -Channel $slack3, $email3)
+    }
+    AfterAll {
+        Invoke-Ctl @"
+DELETE a FROM aghealth.Alert a JOIN aghealth.AlertRule r ON r.RuleId = a.RuleId WHERE r.RuleName = 'pt_Outage';
+DELETE aghealth.AlertRule WHERE RuleName = 'pt_Outage';
+"@
+    }
+
+    It 'labels a retry on the broken channel as Opened, not Escalated' {
+        ($run2 | Where-Object Channel -eq 'pt_Email').Event  | Should -Be 'Opened'
+        ($run2 | Where-Object Channel -eq 'pt_Email').Status | Should -Be 'Failed'
+        @($run2 | Where-Object Channel -eq 'pt_Slack').Count | Should -Be 0      # no duplicate on the working channel
+    }
+    It 'still delivers the resolution to the channel that announced the alert' {
+        ($run3 | Where-Object Channel -eq 'pt_Slack').Event  | Should -Be 'Resolved'
+        ($run3 | Where-Object Channel -eq 'pt_Slack').Status | Should -Be 'Sent'
+    }
+    It 'sends no resolution to a channel that never announced the alert' {
+        @($run3 | Where-Object Channel -eq 'pt_Email').Count | Should -Be 0
+        @($email3.Sent).Count | Should -Be 0
+    }
+}

@@ -369,9 +369,10 @@ END;
 GO
 
 -- What still has to be announced:
---   an open alert whose current severity has not been announced (new, or escalated), and
---   a resolved alert that was announced as open but whose resolution has not been.
--- An alert that opened and resolved between two notifier runs is never announced at all.
+--   an open alert whose current severity has not been announced on every channel (new, or escalated), and
+--   a resolved alert that at least one channel announced as open, whose resolution is still owed.
+-- An alert that opened and resolved before any channel announced it is never announced at all.
+-- Escalated means a channel already announced a different severity of this alert; a retry is not an escalation.
 CREATE OR ALTER VIEW aghealth.PendingNotification
 AS
 SELECT a.AlertId, a.AgName, a.ReplicaServerName, a.DatabaseName, a.Severity, a.State, r.RuleName,
@@ -379,13 +380,17 @@ SELECT a.AlertId, a.AgName, a.ReplicaServerName, a.DatabaseName, a.Severity, a.S
        r.Metric, r.Operator, r.ExpectedValue, r.WarnThreshold, r.CritThreshold, r.Description, r.Runbook,
        CASE WHEN a.State = 'Open' THEN 'Open:' + a.Severity ELSE 'Resolved' END AS EventKey,
        CASE WHEN a.State = 'Resolved' THEN 'Resolved'
-            WHEN EXISTS (SELECT 1 FROM aghealth.Notification n WHERE n.AlertId = a.AlertId AND n.Status = 'Sent')
+            WHEN EXISTS (SELECT 1 FROM aghealth.Notification n
+                         WHERE n.AlertId = a.AlertId AND n.Status = 'Sent'
+                           AND n.EventKey LIKE 'Open:%' AND n.EventKey <> 'Open:' + a.Severity)
                  THEN 'Escalated'
             ELSE 'Opened' END AS Event
 FROM aghealth.Alert a
 JOIN aghealth.AlertRule r ON r.RuleId = a.RuleId
-WHERE (a.State = 'Open'     AND a.NotifiedAt IS NULL)
-   OR (a.State = 'Resolved' AND a.NotifiedAt IS NOT NULL AND a.ResolvedNotifiedAt IS NULL);
+WHERE (a.State = 'Open' AND a.NotifiedAt IS NULL)
+   OR (a.State = 'Resolved' AND a.ResolvedNotifiedAt IS NULL
+       AND EXISTS (SELECT 1 FROM aghealth.Notification n
+                   WHERE n.AlertId = a.AlertId AND n.Status = 'Sent' AND n.EventKey LIKE 'Open:%'));
 GO
 
 -- Records one delivery attempt (insert the first time, count retries after that)
@@ -409,7 +414,8 @@ BEGIN
 END;
 GO
 
--- Marks an event announced once every channel has it. Returns 1 if the alert is now fully announced.
+-- Marks an event announced once every channel that owes it has it. Returns 1 if the alert is now fully announced.
+-- A resolution is owed only by the channels that announced the alert as open.
 CREATE OR ALTER PROCEDURE aghealth.usp_CompleteNotification
     @AlertId  bigint,
     @EventKey varchar(20),
@@ -417,7 +423,12 @@ CREATE OR ALTER PROCEDURE aghealth.usp_CompleteNotification
 AS
 BEGIN
     SET NOCOUNT ON;
-    DECLARE @needed int = (SELECT COUNT(*) FROM OPENJSON(@Channels));
+    DECLARE @needed int =
+        CASE WHEN @EventKey = 'Resolved'
+             THEN (SELECT COUNT(DISTINCT n.Channel) FROM aghealth.Notification n
+                   WHERE n.AlertId = @AlertId AND n.Status = 'Sent' AND n.EventKey LIKE 'Open:%'
+                     AND n.Channel IN (SELECT value FROM OPENJSON(@Channels)))
+             ELSE (SELECT COUNT(*) FROM OPENJSON(@Channels)) END;
     DECLARE @sent int = (SELECT COUNT(*) FROM aghealth.Notification n
                          WHERE n.AlertId = @AlertId AND n.EventKey = @EventKey AND n.Status = 'Sent'
                            AND n.Channel IN (SELECT value FROM OPENJSON(@Channels)));

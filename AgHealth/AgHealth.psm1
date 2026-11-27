@@ -734,12 +734,17 @@ function Send-AgHealthNotification {
     $pending = @(Invoke-DbaQuery @control -EnableException -Query $query -SqlParameter @{ ag = "$AgName" })
     if (-not $pending.Count) { return }
 
-    # What each channel has already delivered, so a retry never duplicates
-    $ids  = ($pending.AlertId | ForEach-Object { [long]$_ }) -join ','
-    $done = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    # What each channel has already delivered, so a retry never duplicates,
+    # and which channels announced each alert as open (only those are owed its resolution)
+    $ids      = ($pending.AlertId | ForEach-Object { [long]$_ }) -join ','
+    $done     = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $openSent = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($n in Invoke-DbaQuery @control -EnableException -Query @"
 SELECT AlertId, Channel, EventKey FROM aghealth.Notification WHERE Status = 'Sent' AND AlertId IN ($ids);
-"@) { $null = $done.Add("$($n.AlertId)|$($n.Channel)|$($n.EventKey)") }
+"@) {
+        $null = $done.Add("$($n.AlertId)|$($n.Channel)|$($n.EventKey)")
+        if ($n.EventKey -like 'Open:*') { $null = $openSent.Add("$($n.AlertId)|$($n.Channel)") }
+    }
 
     $record = {
         param($AlertEvent, $Ch, [string] $Status, [string] $ErrorText)
@@ -752,7 +757,11 @@ SELECT AlertId, Channel, EventKey FROM aghealth.Notification WHERE Status = 'Sen
     }
 
     foreach ($ch in $Channel) {
-        $todo = @($pending | Where-Object { -not $done.Contains("$($_.AlertId)|$($ch.Name)|$($_.EventKey)") })
+        $todo = @($pending | Where-Object {
+            -not $done.Contains("$($_.AlertId)|$($ch.Name)|$($_.EventKey)") -and
+            # A channel that never announced the alert doesn't get its resolution out of nowhere
+            ($_.EventKey -ne 'Resolved' -or $openSent.Contains("$($_.AlertId)|$($ch.Name)"))
+        })
         if (-not $todo.Count) { continue }
 
         if ($ch.Mode -eq 'Digest') {
