@@ -273,7 +273,7 @@
     else if (sync && allSynced) { tone = missing.length ? 'warn' : 'ok'; say = 'Can become PRIMARY with no data loss.'; }
     else if (sync)        { tone = 'crit'; say = `Not now: synchronous but not synchronized (${esc(v.states.map(words).join(', '))}). A failover would lose data or be refused.`; }
     else                  { tone = missing.length ? 'warn' : 'info';
-                            say = `Forced failover only. ${v.rpo == null ? 'Data-loss exposure unknown: commit times could not be compared.' : 'Estimated data-loss exposure: up to about ' + dur(v.rpo) + ' (commit-time lag; subject to telemetry accuracy).'} For no data loss, switch it to synchronous commit and wait for synchronized first.`; }
+                            say = `Forced failover only. ${v.rpo == null ? 'Data-loss exposure unknown: commit times could not be compared.' : v.rpo === 0 ? 'No commit-time lag measured right now; exposure can appear with the next commit.' : 'Estimated data-loss exposure: up to about ' + dur(v.rpo) + ' (commit-time lag; subject to telemetry accuracy).'} For no data loss, switch it to synchronous commit and wait for synchronized first.`; }
     const notes = [];
     if (missing.length) notes.push(`<span class="tag crit">${missing.length} missing: ${missing.slice(0, 2).map((x) => esc(x.ObjectName)).join(', ')}${missing.length > 2 ? ', …' : ''}</span>`);
     if (waiting.length) notes.push(`<span class="tag warn">${waiting.length} waiting for approval</span>`);
@@ -530,7 +530,7 @@
     if (!ag.resolved.length) return '';
     return `<section class="panel" style="margin-top:16px"><h2>Resolved in the last 24 hours</h2><p class="sub">How each one closed: measured, or decided by a person.</p>
       <ol class="tl res">${ag.resolved.slice(0, 10).map((a) => `<li><div><div class="what">${esc(a.Title)} <span class="tag">${esc([a.DatabaseName, a.ObjectName].filter(Boolean).join(' / ') || a.ReplicaServerName || a.AgName)}</span></div>
-        <div class="who">${esc((a.ResolutionNote || (a.ResolvedBy && a.ResolvedBy !== 'measured' ? 'Closed by ' + a.ResolvedBy : 'Measured healthy again')).replace(/\.$/, ''))}.${a.ResolvedAt && a.FirstSeenAt ? ` Was ${esc((a.Severity || '').toLowerCase())} for ${esc(dur((ms(a.ResolvedAt) - ms(a.FirstSeenAt)) / 1000))}.` : ''}</div></div>
+        <div class="who">${esc((a.ResolutionNote || (a.ResolvedBy && a.ResolvedBy !== 'measured' ? 'Closed by ' + a.ResolvedBy : 'Measured healthy again')).replace(/\.$/, ''))}.${a.ResolvedAt && a.FirstSeenAt && !/Open for /.test(a.ResolutionNote || '') ? ` Was ${esc((a.Severity || '').toLowerCase())} for ${esc(dur((ms(a.ResolvedAt) - ms(a.FirstSeenAt)) / 1000))}.` : ''}</div></div>
         <span class="tm">${esc(hhmm(a.ResolvedAt))}</span></li>`).join('')}</ol></section>`;
   }
 
