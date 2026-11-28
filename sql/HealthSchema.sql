@@ -436,8 +436,7 @@ BEGIN
     -- Healthy for ResolveAfterSnapshots snapshots in a row: resolve, and say what was measured
     UPDATE a
     SET State = 'Resolved', ResolvedAt = @At, LastSnapshotId = @SnapshotId, LastValue = n.Value,
-        ResolvedBy = N'measured',
-        ResolutionNote = LEFT(CONCAT(N'Measured: ', ru.Metric, N' = ', n.Value,
+        ResolutionNote = LEFT(CASE WHEN ru.IsEnabled = 0 THEN N'Closed because the rule was disabled: not a measured recovery.' ELSE CONCAT(N'Measured: ', ru.Metric, N' = ', n.Value,
                          CASE WHEN ru.Operator = '>'
                               THEN CONCAT(N' (warn > ', CONVERT(varchar(30), CONVERT(decimal(19,0), ru.WarnThreshold)), N')')
                               ELSE CONCAT(N' (expected ', ru.ExpectedValue, N')') END,
@@ -447,7 +446,8 @@ BEGIN
                          CASE WHEN DATEDIFF(SECOND, a.FirstSeenAt, @At) < 3600
                               THEN CONCAT(DATEDIFF(SECOND, a.FirstSeenAt, @At) / 60, N' min')
                               ELSE CONCAT(DATEDIFF(SECOND, a.FirstSeenAt, @At) / 3600, N' h ',
-                                          DATEDIFF(SECOND, a.FirstSeenAt, @At) % 3600 / 60, N' min') END, N'.'), 400)
+                                          DATEDIFF(SECOND, a.FirstSeenAt, @At) % 3600 / 60, N' min') END, N'.') END, 400),
+        ResolvedBy = CASE WHEN ru.IsEnabled = 0 THEN N'rule disabled' ELSE N'measured' END
     OUTPUT inserted.AlertId, 'Resolved' INTO @Changes
     FROM aghealth.Alert a
     JOIN #Now n ON n.RuleId = a.RuleId AND n.ReplicaServerName = a.ReplicaServerName AND n.DatabaseName = a.DatabaseName
