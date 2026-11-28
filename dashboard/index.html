@@ -120,6 +120,8 @@
   .spark svg { width: 100%; height: 44px; display: block; }
   .spark .area { fill: #7dd3fc1f; } .spark .ln { fill: none; stroke: var(--log); stroke-width: 1.6; }
   .spark .ln.rpo { stroke: var(--warn); } .spark .area.rpo { fill: #f5b0411a; }
+  .spark .cap { font-size: 11px; color: var(--faint); margin-top: 3px; display: flex; justify-content: space-between; }
+  .spark .note { font-size: 11.5px; color: var(--faint); margin: 10px 0 0; line-height: 1.45; }
   .strip { display: flex; gap: 2px; height: 16px; margin-top: 6px; }
   .strip i { flex: 1; border-radius: 2px; background: var(--ok); opacity: .75; }
   .strip i.Failed { background: var(--crit); opacity: 1; } .strip i.Partial { background: var(--warn); opacity: 1; }
@@ -150,7 +152,8 @@
   .step .sh { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .stage { font-family: var(--display); font-size: 12px; padding: 1px 8px; border-radius: var(--r-sm); background: #3b4d6b; }
   .stage.Stage { background: #1d5fb8; } .stage.Compare, .stage.Verify { background: #12795f; }
-  .stage.Decide { background: #a8670b; } .stage.CopyBack { background: #b3343a; }
+  .stage.Decide, .stage.Fix { background: #a8670b; } .stage.CopyBack, .stage.Danger { background: #b3343a; }
+  .stage.Diagnose { background: #12795f; }
   .step .ttl { font-weight: 600; } .step .on { color: var(--muted); font-size: 12.5px; }
   .step .caution { color: #ffd89a; font-size: 12.5px; margin: 4px 0 0; }
   .code { position: relative; margin-top: 6px; }
@@ -242,7 +245,8 @@
   function replicaView(ag) {
     return ag.replicas.map((r) => {
       const dbs = ag.databases.filter((d) => d.ReplicaServerName === r.ReplicaServerName);
-      const worst = (f) => dbs.reduce((m, d) => Math.max(m, d[f] ?? 0), 0);
+      // null when no database reported the value: unknown is shown as unknown, never as 0
+      const worst = (f) => { const k = dbs.map((d) => d[f]).filter((x) => x != null); return k.length ? Math.max(...k) : null; };
       const suspended = dbs.some((d) => d.IsSuspended);
       const states = [...new Set(dbs.map((d) => d.SynchronizationState).filter(Boolean))];
       const primary = r.Role === 'PRIMARY';
@@ -268,7 +272,7 @@
     else if (sync && allSynced) { tone = missing.length ? 'warn' : 'ok'; say = 'Can become PRIMARY with no data loss.'; }
     else if (sync)        { tone = 'crit'; say = `Not now: synchronous but not synchronized (${esc(v.states.map(words).join(', '))}). A failover would lose data or be refused.`; }
     else                  { tone = missing.length ? 'warn' : 'info';
-                            say = `Forced failover only, losing about ${dur(v.rpo)} of committed work. For no data loss, switch it to synchronous commit and wait for synchronized first.`; }
+                            say = `Forced failover only. ${v.rpo == null ? 'Data-loss exposure unknown: commit times could not be compared.' : 'Estimated data-loss exposure: up to about ' + dur(v.rpo) + ' (commit-time lag; subject to telemetry accuracy).'} For no data loss, switch it to synchronous commit and wait for synchronized first.`; }
     const notes = [];
     if (missing.length) notes.push(`<span class="tag crit">${missing.length} missing: ${missing.slice(0, 2).map((x) => esc(x.ObjectName)).join(', ')}${missing.length > 2 ? ', …' : ''}</span>`);
     if (waiting.length) notes.push(`<span class="tag warn">${waiting.length} waiting for approval</span>`);
@@ -358,7 +362,7 @@
       // Labels sit just before the secondary, above and below the line where it runs level
       const lx = x2 - 14;
       labels += `<text class="lbl" x="${lx}" y="${y2 - 9}" text-anchor="end">${v.down ? 'disconnected' : v.suspended ? 'data movement suspended' : `queued <tspan class="v">${kb(v.sendKb)}</tspan>`}</text>
-                 <text class="lbl" x="${lx}" y="${y2 + 19}" text-anchor="end">RPO <tspan class="v">${dur(v.rpo)}</tspan> &#160; RTO <tspan class="v">${dur(v.rto)}</tspan></text>`;
+                 <text class="lbl" x="${lx}" y="${y2 + 19}" text-anchor="end">${v.r.AvailabilityMode === 'SYNCHRONOUS_COMMIT' ? 'data loss' : 'lag'} <tspan class="v">${v.rpo == null ? 'unknown' : dur(v.rpo)}</tspan> &#160; redo <tspan class="v">${v.rto == null ? 'unknown' : '~' + dur(v.rto)}</tspan></text>`;
     });
     const nodes = node(pri, px, py) + secs.map((v, i) => node(v, sx, 20 + i * (nodeH + gap))).join('');
     return `<svg class="topo" viewBox="0 0 ${W} ${H}" role="img" aria-label="Replica topology">${links}${packets}${labels}${nodes}</svg>`;
@@ -372,40 +376,60 @@
       : d.SynchronizationHealth ? (d.SynchronizationHealth === 'HEALTHY' ? 'healthy' : 'warning')
       : (['SYNCHRONIZED', 'SYNCHRONIZING'].includes(d.SynchronizationState) ? 'healthy' : 'warning');
     return `<div style="overflow-x:auto"><table class="dbs"><thead><tr><th>Replica</th><th>Database</th><th>State</th>
-        <th class="r">Log queued</th><th class="r">Redo queued</th><th class="r">RPO</th><th class="r">RTO</th></tr></thead><tbody>
+        <th class="r">Log queued</th><th class="r">Redo queued</th><th class="r" title="Synchronous and synchronized: 0. Otherwise the commit-time lag, an estimate of data-loss exposure">Data loss / lag</th><th class="r" title="Redo queue divided by the last reported redo rate: an estimate, not a measured RTO">Redo time (est.)</th></tr></thead><tbody>
       ${rows.map(({ v, d }) => `<tr><td>${esc(v.r.ReplicaServerName)}${v.primary ? ' <span class="tag">primary</span>' : ''}</td><td>${esc(d.DatabaseName)}</td>
         <td><span class="st"><span class="dot ${tone(d)}"></span>${esc(d.IsSuspended ? 'suspended' + (d.SuspendReason ? ' (' + words(d.SuspendReason) + ')' : '') : words(d.SynchronizationState))}</span></td>
         <td class="r"><span class="num">${v.primary ? '–' : kb(d.LogSendQueueKb)}</span></td><td class="r"><span class="num">${v.primary ? '–' : kb(d.RedoQueueKb)}</span></td>
-        <td class="r"><span class="num">${v.primary ? '–' : dur(d.EstimatedDataLossSec)}</span></td><td class="r"><span class="num">${v.primary ? '–' : dur(d.EstimatedRecoverySec)}</span></td></tr>`).join('')}
+        <td class="r"><span class="num">${v.primary ? '–' : d.EstimatedDataLossSec == null ? 'unknown' : dur(d.EstimatedDataLossSec)}</span></td><td class="r"><span class="num">${v.primary ? '–' : d.EstimatedRecoverySec == null ? 'unknown' : dur(d.EstimatedRecoverySec)}</span></td></tr>`).join('')}
       </tbody></table></div>`;
   }
 
-  function sparkline(points, key, cls) {
-    if (points.length < 2) return '<svg viewBox="0 0 300 44"></svg>';
-    const vals = points.map((p) => p[key] ?? 0), max = Math.max(1, ...vals), w = 300, h = 44;
+  // floor: the smallest top of scale, so a tiny value (60 KB, 1 s) draws as tiny instead of filling the chart.
+  // The caption says what the top of the chart means and the peak in the window.
+  function sparkline(points, key, cls, floor, fmt) {
+    if (points.length < 2) return '<svg viewBox="0 0 300 44"></svg><div class="cap"><span>Not enough snapshots yet</span></div>';
+    const vals = points.map((p) => p[key] ?? 0), peak = Math.max(0, ...vals), max = Math.max(floor || 1, peak), w = 300, h = 44;
     const xy = vals.map((v, i) => [(i / (vals.length - 1)) * w, h - 3 - (v / max) * (h - 8)]);
     const line = xy.map((p, i) => (i ? 'L' : 'M') + p[0].toFixed(1) + ',' + p[1].toFixed(1)).join(' ');
-    return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><path class="area ${cls}" d="${line} L${w},${h} L0,${h} Z"/><path class="ln ${cls}" d="${line}"/></svg>`;
+    return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><path class="area ${cls}" d="${line} L${w},${h} L0,${h} Z"/><path class="ln ${cls}" d="${line}"/></svg>
+      <div class="cap"><span>Top of chart ${fmt(max)}</span><span>Peak ${fmt(peak)}</span></div>`;
   }
 
   function side(ag, view) {
     const crit = ag.alerts.filter((a) => a.Severity === 'Critical').length, warn = ag.alerts.length - crit;
     const sec = view.filter((v) => !v.primary);
-    const rpo = Math.max(0, ...sec.map((v) => v.rpo)), rto = Math.max(0, ...sec.map((v) => v.rto));
+    // Worst of what was measured; replicas whose value is unknown are named, not counted as 0
+    const worstOf = (f) => { const k = sec.map((v) => v[f]).filter((x) => x != null); return k.length ? Math.max(...k) : null; };
+    const unknownOf = (f) => sec.filter((v) => v[f] == null).map((v) => esc(v.r.ReplicaServerName));
+    const rpo = worstOf('rpo'), rto = worstOf('rto'), rpoUnk = unknownOf('rpo'), rtoUnk = unknownOf('rto');
+    const unk = (list) => list.length ? `<br>unknown for ${list.join(', ')}` : '';
+    // Recovery paths, kept apart: HA = a synchronous replica that is synchronized (no data loss by design);
+    // DR = an asynchronous replica, where the only figure is commit-time lag, an estimate of exposure.
+    const isSync = (v) => v.r.AvailabilityMode === 'SYNCHRONOUS_COMMIT';
+    const ready = (v) => !v.down && !v.suspended && v.dbs.length && v.dbs.every((d) => d.SynchronizationState === 'SYNCHRONIZED');
+    const ha = sec.filter((v) => isSync(v) && ready(v)), dr = sec.filter((v) => !isSync(v));
+    const drLag = (() => { const k = dr.map((v) => v.rpo).filter((x) => x != null); return k.length ? Math.max(...k) : null; })();
+    const names = (list) => list.map((v) => esc(v.r.ReplicaServerName)).join(', ');
     const kpis = `<div class="kpis">
       <div class="kpi ${crit ? 'crit' : 'ok'}"><div class="v">${crit}</div><div class="l">Critical alerts open</div></div>
       <div class="kpi ${warn ? 'warn' : 'ok'}"><div class="v">${warn}</div><div class="l">Warnings open</div></div>
-      <div class="kpi ${rpo > 300 ? 'crit' : rpo > 60 ? 'warn' : 'ok'}"><div class="v">${dur(rpo)}</div><div class="l">Worst data loss if the primary failed now (RPO)</div></div>
-      <div class="kpi ${rto > 900 ? 'crit' : rto > 300 ? 'warn' : 'ok'}"><div class="v">${dur(rto)}</div><div class="l">Worst time to come online after failover (RTO)</div></div></div>`;
+      <div class="kpi ${ha.length ? 'ok' : 'crit'}"><div class="v">${ha.length ? '0 s' : 'none'}</div><div class="l">${ha.length
+          ? `HA path, expected data loss: ${names(ha)}, synchronous and synchronized`
+          : 'HA path: no synchronous replica is synchronized right now'}</div></div>
+      <div class="kpi ${!dr.length ? 'ok' : drLag == null ? 'warn' : drLag > 300 ? 'crit' : drLag > 60 ? 'warn' : 'ok'}"><div class="v">${!dr.length ? '–' : drLag == null ? 'unknown' : dur(drLag)}</div><div class="l">${dr.length
+          ? `DR path, commit-time lag: ${names(dr)}, asynchronous (an estimate of exposure, not verified data loss)${unk(dr.filter((v) => v.rpo == null).map((v) => esc(v.r.ReplicaServerName)))}`
+          : 'DR path: no asynchronous replica'}</div></div>
+      <div class="kpi ${rto > 900 ? 'crit' : rto > 300 ? 'warn' : 'ok'}"><div class="v">${rto == null ? 'unknown' : '~' + dur(rto)}</div><div class="l">Estimated redo time, worst replica: redo queue divided by the last reported redo rate, not a measured RTO${unk(rtoUnk)}</div></div>
+      <div class="kpi ${ha.length ? 'ok' : 'warn'}"><div class="v">${ha.length ? esc(ha[0].r.ReplicaServerName) : 'none'}</div><div class="l">Preferred failover target${ha.length ? ': planned failover, no data loss' : ': no lossless target right now'}</div></div></div>`;
     const sparks = sec.map((v) => {
       const pts = ag.trend.filter((t) => t.ReplicaServerName === v.r.ReplicaServerName);
       // One point per snapshot: the worst database of this replica
       const by = new Map(); pts.forEach((p) => { const o = by.get(p.t) || { t: p.t, q: 0, rpo: 0 };
         o.q = Math.max(o.q, p.LogSendQueueKb || 0); o.rpo = Math.max(o.rpo, p.EstimatedDataLossSec || 0); by.set(p.t, o); });
       const series = [...by.values()];
-      return `<h3><span>${esc(v.r.ReplicaServerName)}: log queued</span><span class="num">${kb(v.sendKb)}</span></h3>${sparkline(series, 'q', '')}
-              <h3><span>${esc(v.r.ReplicaServerName)}: RPO</span><span class="num">${dur(v.rpo)}</span></h3>${sparkline(series, 'rpo', 'rpo')}`;
-    }).join('');
+      return `<h3><span>${esc(v.r.ReplicaServerName)}: log not yet sent (send queue)</span><span class="num">${kb(v.sendKb)}</span></h3>${sparkline(series, 'q', '', 1024, kb)}
+              <h3><span>${esc(v.r.ReplicaServerName)}: ${v.r.AvailabilityMode === 'SYNCHRONOUS_COMMIT' ? 'data at risk' : 'commit-time lag'}</span><span class="num">${v.rpo == null ? 'unknown' : dur(v.rpo)}</span></h3>${sparkline(series, 'rpo', 'rpo', 30, dur)}`;
+    }).join('') + `<p class="note">One point per snapshot, oldest on the left. Send queue: log the primary has written but not yet sent to that replica, as the primary reports it (an idle database can keep reporting a small leftover value). Data at risk: 0 for a synchronous replica that is synchronized, because every commit is hardened there first; a redo backlog is not data loss. Commit-time lag: how far the replica's last commit trails the primary's, an estimate of exposure for an asynchronous replica.</p>`;
     const strip = ag.strip.slice(-60).map((s) => `<i class="${esc(s.Status)}" title="${esc(hhmm(s.t))} ${esc(s.Status)}"></i>`).join('');
     return `<section class="panel"><h2>Health right now</h2><p class="sub">Snapshot ${n0(ag.snapshot.SnapshotId)}, ${esc(ago(ag.snapshot.CollectedAt))}, ${n0(ag.snapshot.DurationMs)} ms</p>
       ${kpis}<div class="spark">${sparks}<h3><span>Snapshots, last ${state.data.trendMinutes} min</span><span>${ag.strip.filter((s) => s.Status !== 'Succeeded').length} not clean</span></h3><div class="strip">${strip}</div></div></section>`;
@@ -415,7 +439,10 @@
   function incident(a) {
     const path = [a.ReplicaServerName, a.DatabaseName, a.ObjectName].filter(Boolean).join(' / ');
     const ev = (a.Evidence || []).map((e) => `<dt>${esc(e.Label)}</dt><dd>${e.Label === 'Statement' ? `<code>${esc(e.Value)}</code>` : esc(e.Value)}</dd>`).join('');
-    const plan = (a.Plan || []).length ? `<div class="plan"><h4>Recovery plan</h4><p class="note">Scripts are ready; nothing has been run. Production is never restored over.</p>
+    const recovery = (a.Plan || []).some((s) => s.Stage === 'Stage' || s.Stage === 'CopyBack');
+    const plan = (a.Plan || []).length ? `<div class="plan"><h4>${recovery ? 'Recovery plan' : 'Diagnose and fix'}</h4><p class="note">${recovery
+        ? 'Scripts are ready; nothing has been run. Production is never restored over.'
+        : 'Scripts are ready, filled in for this AG, replica and database; nothing has been run. Diagnose steps only read.'}</p>
       ${a.Plan.map((s) => `<div class="step"><div class="sh"><span class="stage ${esc(s.Stage)}">${s.Step} ${esc(s.Stage)}</span><span class="ttl">${esc(s.Title)}</span><span class="on">run on ${esc(s.RunOn)}</span></div>
         ${s.Caution ? `<p class="caution">${esc(s.Caution)}</p>` : ''}
         <div class="code"><pre>${esc(s.Sql)}</pre><button type="button" data-copy="${a.AlertId}:${s.Step}">Copy</button></div></div>`).join('')}</div>` : '';

@@ -82,8 +82,12 @@ SELECT ar.replica_server_name, adc.database_name, drs.is_primary_replica,
        drs.is_suspended, drs.suspend_reason_desc,
        drs.log_send_queue_size, drs.log_send_rate, drs.redo_queue_size, drs.redo_rate,
        drs.last_hardened_lsn, drs.last_commit_time,
-       -- RPO: how far this replica's last commit is behind the primary's
+       -- RPO: how far this replica's last commit is behind the primary's.
+       -- A synchronous replica that is SYNCHRONIZED hardens every commit before the primary acknowledges it:
+       -- nothing committed can be lost there. Its last_commit_time follows REDO, not hardening, so comparing
+       -- commit times would report a redo delay as data loss.
        CASE WHEN drs.is_primary_replica = 1 THEN 0
+            WHEN ar.availability_mode_desc = 'SYNCHRONOUS_COMMIT' AND drs.synchronization_state_desc = 'SYNCHRONIZED' THEN 0
             WHEN drs.last_commit_time IS NULL OR p.last_commit_time IS NULL THEN NULL
             WHEN p.last_commit_time <= drs.last_commit_time THEN 0
             ELSE DATEDIFF(SECOND, drs.last_commit_time, p.last_commit_time) END AS est_data_loss_sec,
@@ -405,6 +409,341 @@ function Get-AgHealthProbe {
 
 #region Public functions ------------------------------------------------------
 
+function Save-AgHealthAlertPlan {
+    # Stores evidence lines and script steps for one alert (only if it has none yet)
+    param([hashtable] $Control, [long] $AlertId, [object[]] $Evidence, [object[]] $Steps)
+    $null = Invoke-DbaQuery @Control -EnableException -Query @"
+SET XACT_ABORT ON;
+BEGIN TRAN;
+IF NOT EXISTS (SELECT 1 FROM aghealth.AlertScript WHERE AlertId = @a)
+    INSERT aghealth.AlertScript (AlertId, Step, Stage, Title, RunOn, Caution, Sql)
+    SELECT @a, j.Step, j.Stage, j.Title, j.RunOn, j.Caution, j.Sql
+    FROM OPENJSON(@steps) WITH (Step int, Stage varchar(20), Title nvarchar(200), RunOn nvarchar(128),
+                                Caution nvarchar(400), Sql nvarchar(max)) j;
+INSERT aghealth.AlertEvidence (AlertId, SortOrder, Label, Value)
+SELECT @a, j.SortOrder, j.Label, LEFT(j.Value, 2000)
+FROM OPENJSON(@ev) WITH (SortOrder int, Label nvarchar(60), Value nvarchar(max)) j
+WHERE j.Value IS NOT NULL AND j.Value <> N''
+  AND NOT EXISTS (SELECT 1 FROM aghealth.AlertEvidence e WHERE e.AlertId = @a AND e.SortOrder = j.SortOrder);
+COMMIT;
+"@ -SqlParameter @{ a = $AlertId; steps = ConvertTo-Json -InputObject @($Steps) -Depth 3 -Compress
+                    ev = ConvertTo-Json -InputObject @($Evidence) -Depth 3 -Compress }
+}
+
+function New-AgHealthAlertPlan {
+    # Evidence collected the moment an AG health alert opens, and Diagnose / Fix / Verify scripts filled in with
+    # this AG, replica and database. The fix is chosen from the evidence. Nothing is run: a person (or, later, an
+    # agent within the approval policy) runs the steps.
+    [CmdletBinding()]
+    param($Alert, [hashtable] $Context, [hashtable] $Control)
+    $ag = $Context.AgName; $P = $Context.Primary
+    $R  = [string]$Alert.ReplicaServerName; $D = [string]$Alert.DatabaseName; $rule = [string]$Alert.RuleName
+    $q   = { param([string] $n) '[' + $n.Replace(']', ']]') + ']' }
+    $lit = { param([string] $v) "N'" + $v.Replace("'", "''") + "'" }
+    $ev  = [Collections.Generic.List[object]]::new()
+    $steps = [Collections.Generic.List[object]]::new()
+    $addEv = { param([string] $Label, $Value) if ("$Value") { $ev.Add([pscustomobject]@{ SortOrder = $ev.Count + 1; Label = $Label; Value = [string]$Value }) } }
+    $add = { param($Stage, $Title, $RunOn, $Caution, [string[]] $Sql)
+             $steps.Add([pscustomobject]@{ Step = $steps.Count + 1; Stage = $Stage; Title = $Title; RunOn = $RunOn
+                                           Caution = $Caution; Sql = ($Sql -join "`n") }) }
+    $live = { param([string] $Name, [string] $Query, [string] $Database = 'master')
+              $srv = $Context.Servers[$Name]
+              # No output (not $null) when it cannot be read, so @(& $live ...) is empty rather than one null row
+              if (-not $srv) { return }
+              try { Invoke-DbaQuery -SqlInstance $srv -Database $Database -Query $Query -EnableException } catch { } }
+    $fmtKb  = { param($v) Format-AgHealthValue 'LogSendQueueKb' $v }
+    $fmtSec = { param($v) Format-AgHealthValue 'EstimatedDataLossSec' $v }
+
+    $db    = $Context.Databases | Where-Object { $_.ReplicaServerName -eq $R -and $_.DatabaseName -eq $D } | Select-Object -First 1
+    $rep   = $Context.Replicas  | Where-Object { $_.ReplicaServerName -eq $R } | Select-Object -First 1
+    $qD = & $q $D; $lD = & $lit $D; $lAg = & $lit $ag
+
+    # Reusable queries, already pointed at this AG and database
+    $stateSql = @(
+        '-- Every replica of this database, as the primary sees it',
+        'SELECT ar.replica_server_name, drs.synchronization_state_desc, drs.synchronization_health_desc,',
+        '       drs.is_suspended, drs.suspend_reason_desc,',
+        '       drs.log_send_queue_size AS send_queue_kb, drs.log_send_rate AS send_kb_per_s,',
+        '       drs.redo_queue_size AS redo_queue_kb, drs.redo_rate AS redo_kb_per_s, drs.last_commit_time',
+        'FROM sys.dm_hadr_database_replica_states AS drs',
+        'JOIN sys.availability_replicas AS ar ON ar.replica_id = drs.replica_id',
+        "WHERE drs.database_id = DB_ID($lD);")
+    $localSql = @(
+        "-- What $R itself reports for $D (the suspend reason is only reliable here)",
+        'SELECT DB_NAME(drs.database_id) AS database_name, drs.synchronization_state_desc, drs.is_suspended,',
+        '       drs.suspend_reason_desc, drs.redo_queue_size AS redo_queue_kb, drs.redo_rate AS redo_kb_per_s',
+        'FROM sys.dm_hadr_database_replica_states AS drs',
+        "WHERE drs.is_local = 1 AND drs.database_id = DB_ID($lD);")
+    $replicaSql = @(
+        '-- Every replica of the AG: connection state and the last connection error',
+        'SELECT ar.replica_server_name, ar.availability_mode_desc, ars.role_desc, ars.connected_state_desc,',
+        '       ars.synchronization_health_desc, ars.last_connect_error_number, ars.last_connect_error_description,',
+        '       ars.last_connect_error_timestamp',
+        'FROM sys.availability_groups AS ag',
+        'JOIN sys.availability_replicas AS ar ON ar.group_id = ag.group_id',
+        'LEFT JOIN sys.dm_hadr_availability_replica_states AS ars ON ars.replica_id = ar.replica_id',
+        "WHERE ag.name = $lAg;")
+    $logSql = @(
+        "-- How full the log of $D is on the primary, and what stops it from truncating",
+        "USE $qD;",
+        'SELECT d.log_reuse_wait_desc, CONVERT(decimal(5,1), u.used_log_space_in_percent) AS log_used_pct,',
+        '       u.total_log_size_in_bytes / 1048576 AS log_size_mb',
+        'FROM sys.dm_db_log_space_usage AS u CROSS JOIN sys.databases AS d WHERE d.database_id = DB_ID();')
+    $tranSql = @(
+        "-- The open transactions writing the most log in $D on the primary (the usual cause of a growing send queue)",
+        'SELECT TOP (5) s.session_id, s.login_name, s.host_name, s.program_name,',
+        '       dt.database_transaction_log_bytes_used / 1048576 AS log_mb, at.transaction_begin_time',
+        'FROM sys.dm_tran_database_transactions AS dt',
+        'JOIN sys.dm_tran_session_transactions AS st ON st.transaction_id = dt.transaction_id',
+        'JOIN sys.dm_tran_active_transactions AS at ON at.transaction_id = dt.transaction_id',
+        'JOIN sys.dm_exec_sessions AS s ON s.session_id = st.session_id',
+        "WHERE dt.database_id = DB_ID($lD)",
+        'ORDER BY dt.database_transaction_log_bytes_used DESC;')
+    $endpointSql = @(
+        "-- The HADR endpoint on ${R}: started? which port? and when does its certificate expire?",
+        'SELECT e.name, e.state_desc, t.port, e.role_desc, e.connection_auth_desc, c.name AS certificate, c.expiry_date',
+        'FROM sys.database_mirroring_endpoints AS e',
+        'LEFT JOIN sys.tcp_endpoints AS t ON t.endpoint_id = e.endpoint_id',
+        'LEFT JOIN sys.certificates AS c ON c.certificate_id = e.certificate_id;')
+    $redoSql = @(
+        "-- Is redo on $R blocked by a query on this readable secondary? Who is blocking it?",
+        'SELECT r.session_id AS redo_session, r.command, r.wait_type, r.wait_time / 1000 AS wait_s,',
+        '       r.blocking_session_id, s.login_name, s.host_name, s.program_name, t.text AS blocker_sql',
+        'FROM sys.dm_exec_requests AS r',
+        'LEFT JOIN sys.dm_exec_sessions AS s ON s.session_id = r.blocking_session_id',
+        'LEFT JOIN sys.dm_exec_connections AS c ON c.session_id = r.blocking_session_id',
+        'OUTER APPLY sys.dm_exec_sql_text(c.most_recent_sql_handle) AS t',
+        "WHERE r.command IN ('DB STARTUP', 'PARALLEL REDO TASK', 'PARALLEL REDO HELP TASK') AND r.blocking_session_id > 0;")
+    # Every Fix starts with guards: the right server, the state it is meant to change, and who authorized it
+    $guard = { param([string] $Server, [string[]] $StillTrue, [string] $NothingToDo)
+        @("-- Guards: stop on the wrong server; do nothing if the problem has already cleared",
+          "IF @@SERVERNAME <> $(& $lit $Server) THROW 50100, 'Wrong server: run this on $Server.', 1;") +
+        $(if ($StillTrue) { @("IF NOT EXISTS ($($StillTrue -join ' '))",
+                              "BEGIN PRINT N'$($NothingToDo.Replace("'", "''"))'; RETURN; END;") } else { @() }) +
+        @('-- Authorized by: <your name>, <incident or change reference>') }
+    $suspendedCheck = @("SELECT 1 FROM sys.dm_hadr_database_replica_states WHERE is_local = 1 AND is_suspended = 1 AND database_id = DB_ID($lD)")
+    # Verify: three readings, 10 seconds apart. Healthy = moving every time and the send queue not growing.
+    $sustainedSql = @(
+        "-- Three readings 10 seconds apart: healthy means $R is SYNCHRONIZING or SYNCHRONIZED every time,",
+        '-- not suspended, and its send queue is not growing. One good reading is not enough.',
+        'DROP TABLE IF EXISTS #v; CREATE TABLE #v (reading int, at_utc datetime2(0), replica sysname, state nvarchar(60),',
+        '       suspended bit, send_queue_kb bigint, redo_queue_kb bigint);',
+        'DECLARE @i int = 1;',
+        'WHILE @i <= 3',
+        'BEGIN',
+        '    INSERT #v SELECT @i, SYSUTCDATETIME(), ar.replica_server_name, drs.synchronization_state_desc, drs.is_suspended,',
+        '           drs.log_send_queue_size, drs.redo_queue_size',
+        '    FROM sys.dm_hadr_database_replica_states AS drs JOIN sys.availability_replicas AS ar ON ar.replica_id = drs.replica_id',
+        "    WHERE drs.database_id = DB_ID($lD);",
+        "    IF @i < 3 WAITFOR DELAY '00:00:10';",
+        '    SET @i += 1;',
+        'END;',
+        'SELECT replica, reading, at_utc, state, suspended, send_queue_kb, redo_queue_kb FROM #v ORDER BY replica, reading;')
+    $notAvailable = { param([string] $What, [string] $Server) "Not available: could not read $What from $Server." }
+    $others = { ($Context.Databases | Where-Object { $_.DatabaseName -eq $D -and $_.ReplicaServerName -ne $R -and -not $_.IsPrimaryReplica } |
+                 ForEach-Object { '{0} {1}' -f $_.ReplicaServerName, ($(if ($_.IsSuspended) { 'suspended' } else { ([string]$_.SynchronizationState).ToLower() })) }) -join ', ' }
+
+    # Log reuse wait, said as what it means. NOTHING is not a restriction, so it is never called one.
+    $logWhy = { param([string] $Wait)
+        switch -Regex ($Wait) {
+            '^NOTHING$'              { 'no log reuse restriction reported at this reading'; break }
+            '^AVAILABILITY_REPLICA$' { 'log reuse is waiting on availability replica progress: the log can grow while a replica is behind and transactions keep writing'; break }
+            '^LOG_BACKUP$'           { 'a transaction log backup is required for log reuse'; break }
+            '^ACTIVE_TRANSACTION$'   { 'an active transaction is preventing log reuse'; break }
+            '^$'                     { 'log reuse information unavailable'; break }
+            default                  { "log reuse is waiting on $Wait" } } }
+    $logLine = { param($l, [string] $Extra)
+        '{0}% of {1} MB used; {2}{3}.' -f $l.log_used_pct, $l.log_size_mb, (& $logWhy ([string]$l.log_reuse_wait_desc)), $Extra }
+
+    # Observed movement: what changed between the last two snapshots of this replica and database,
+    # measured by the collector, rather than the rate SQL Server last reported
+    $hist = @()
+    try {
+        $hist = @(Invoke-DbaQuery @Control -EnableException -SqlParameter @{ ag = $ag; r = $R; d = $D } -Query @"
+SELECT TOP (2) s.CollectedAt, d.LogSendQueueKb, d.RedoQueueKb, d.LastHardenedLsn
+FROM aghealth.DatabaseState AS d JOIN aghealth.Snapshot AS s ON s.SnapshotId = d.SnapshotId
+WHERE s.AgName = @ag AND d.ReplicaServerName = @r AND d.DatabaseName = @d
+ORDER BY d.SnapshotId DESC;
+"@)
+    } catch { }
+    $num = { param($v) if ($null -eq $v -or $v -is [DBNull] -or "$v" -eq '') { $null } else { [double]$v } }
+    $lsnStalled = $null
+    $observed = if ($hist.Count -lt 2) { 'Not available: fewer than two snapshots of this database on this replica so far.' } else {
+        $secs = [int]([datetime]$hist[0].CollectedAt - [datetime]$hist[1].CollectedAt).TotalSeconds
+        $lsnStalled = ("$($hist[0].LastHardenedLsn)" -ne '' -and "$($hist[0].LastHardenedLsn)" -eq "$($hist[1].LastHardenedLsn)")
+        $delta = { param([string] $Name, $Now, $Before)
+            $n = & $num $Now; $b = & $num $Before
+            if ($null -eq $n -or $null -eq $b) { "$Name queue not reported" }
+            elseif ($n -gt $b) { "$Name queue grew by $(& $fmtKb ($n - $b))" }
+            elseif ($n -lt $b) { "$Name queue shrank by $(& $fmtKb ($b - $n))" }
+            else { "$Name queue unchanged at $(& $fmtKb $n)" } }
+        $lsnText = if ("$($hist[0].LastHardenedLsn)" -eq '') { 'hardened LSN not reported' }
+                   elseif ($lsnStalled) { 'hardened LSN did not advance' } else { 'hardened LSN advanced' }
+        'Over the last {0} s (two snapshots): {1}; {2}; {3}.' -f $secs, $lsnText,
+            (& $delta 'send' $hist[0].LogSendQueueKb $hist[1].LogSendQueueKb), (& $delta 'redo' $hist[0].RedoQueueKb $hist[1].RedoQueueKb)
+    }
+    $rates = { param($d) 'send {0}/s, redo {1}/s (the rates SQL Server last reported; they can reflect earlier activity, not this moment)' -f
+                   (& $fmtKb $d.LogSendRateKbSec), (& $fmtKb $d.RedoRateKbSec) }
+
+    # RPO, said honestly: measured lag, zero for now, growing exposure, possibly stale, or unknown
+    $rpo = { param($d)
+        if (-not $d) { return 'Unknown: this replica and database were not in the snapshot.' }
+        $e = & $num $d.EstimatedDataLossSec
+        $at = if ("$($d.LastCommitTime)") { '{0:HH:mm:ss} UTC' -f [datetime]$d.LastCommitTime } else { 'an unknown time' }
+        $moving = -not $d.IsSuspended -and ([string]$d.SynchronizationState) -in 'SYNCHRONIZING', 'SYNCHRONIZED'
+        if ($null -eq $e) { 'Unknown: the last commit times of the primary and this replica could not be compared.' }
+        elseif (-not $moving -and $e -gt 0) { "$(& $fmtSec $e) and growing: $R last received a commit at $at, and the primary has committed since." }
+        elseif (-not $moving) { "0 s for now, not a guarantee: no commit on the primary since $R stopped receiving at $at. Exposure starts with the next commit and grows until data movement resumes." }
+        elseif ($lsnStalled -and $e -gt 0) { "$(& $fmtSec $e), possibly stale: the hardened LSN did not advance between the last two snapshots." }
+        else { "$(& $fmtSec $e) measured: last commit times compared at this snapshot." } }
+
+    switch ($rule) {
+        'DatabaseSuspended' {
+            $reason = if ($db) { [string]$db.SuspendReason } else { '' }
+            $meaning = switch -Regex ($reason) {
+                '^SUSPEND_FROM_USER$'    { 'Suspended by an ALTER DATABASE ... SET HADR SUSPEND command, from a person, a job or a script. Safe to resume once you know why it was run.'; break }
+                '^SUSPEND_FROM_PARTNER$' { 'Suspended because of the partner replica. Resume it from the primary.'; break }
+                '^SUSPEND_FROM_(REDO|APPLY|UNDO|RESTART|CAPTURE|REVALIDATION|XRF_UPDATE)$' {
+                    "$R suspended itself after an error ($(($reason -replace 'SUSPEND_FROM_', '').ToLower())). A RESUME fails again until the cause is fixed (disk full, a file path that does not exist here, corruption): read its error log first."; break }
+                default { 'Reason not reported. Read it on the replica itself (step 1).' }
+            }
+            & $addEv 'Suspend reason' $(if ($reason) { $reason } else { 'not reported' })
+            & $addEv 'What it means' $meaning
+            $log = @(& $live $P (($logSql | Select-Object -Skip 2) -join "`n") $D)
+            if ($log.Count) {
+                $extra = if ([string]$log[0].log_reuse_wait_desc -eq 'NOTHING') {
+                    ". While $R stays suspended, the primary keeps the log it has not sent there, so reuse can start waiting on AVAILABILITY_REPLICA" } else { '' }
+                & $addEv 'Primary log' (& $logLine $log[0] $extra)
+            } else { & $addEv 'Primary log' (& $notAvailable 'the log space' $P) }
+            & $addEv 'Data at risk (RPO)' (& $rpo $db)
+            & $addEv 'Observed movement' $observed
+            & $addEv 'Other replicas' (& $others)
+            & $add 'Diagnose' "Read the suspend reason and the error log on $R" $R $null (@($localSql) + @('',
+                  '-- The error log around the suspension. SQL Server 2022 and later: VIEW ANY ERROR LOG;',
+                  '-- earlier versions: membership of securityadmin or sysadmin.',
+                  "EXEC sys.xp_readerrorlog 0, 1, $lD;"))
+            & $add 'Diagnose' 'How full the primary log is, and why it cannot truncate' $P $null $logSql
+            if ($reason -eq 'SUSPEND_FROM_PARTNER') {
+                & $add 'Fix' "Resume data movement for $D" $P $null (@(& $guard $P) + @("ALTER DATABASE $qD SET HADR RESUME;"))
+            } else {
+                $caution = if ($reason -match '^SUSPEND_FROM_(REDO|APPLY|UNDO|RESTART|CAPTURE|REVALIDATION|XRF_UPDATE)$') {
+                    'Fix the cause in the error log first: a RESUME before that suspends again.' } else { $null }
+                & $add 'Fix' "Resume data movement for $D on $R" $R $caution (@(& $guard $R $suspendedCheck "$D is not suspended on ${R}: nothing to do.") +
+                    @("ALTER DATABASE $qD SET HADR RESUME;"))
+            }
+            & $add 'Verify' "$R keeps moving: three readings, 10 seconds apart" $P $null $sustainedSql
+        }
+        { $_ -in 'SyncSecondaryNotSynced', 'AsyncSecondaryNotMoving' } {
+            & $addEv 'State now' $(if ($db) { "$(([string]$db.SynchronizationState).ToLower())$(if ($db.IsSuspended) { ', suspended (' + $db.SuspendReason + ')' })" })
+            & $addEv 'Connection' $(if ($rep) { "$([string]$rep.ConnectedState)$(if ($rep.LastConnectErrorText) { ': ' + $rep.LastConnectErrorText })" })
+            if ($db) {
+                & $addEv 'Queues' ('send {0}, redo {1}' -f (& $fmtKb $db.LogSendQueueKb), (& $fmtKb $db.RedoQueueKb))
+                & $addEv 'Last reported rates' (& $rates $db)
+            } else { & $addEv 'Queues' "Not available: $R and $D were not in the snapshot." }
+            & $addEv 'Observed movement' $observed
+            & $addEv 'Data at risk (RPO)' (& $rpo $db)
+            & $addEv 'What it means' $(if ($rule -eq 'SyncSecondaryNotSynced') { "A failover to $R now would lose data, or be refused." } else { "$R, the DR copy, is falling behind." })
+            & $add 'Diagnose' 'Every replica of the database, and every connection' $P $null (@($stateSql) + @('') + @($replicaSql))
+            & $add 'Diagnose' "What $R itself reports" $R $null $localSql
+            if ($db -and $db.IsSuspended) {
+                & $add 'Fix' "Resume data movement for $D on $R" $R $null (@(& $guard $R $suspendedCheck "$D is not suspended on ${R}: nothing to do.") +
+                    @("ALTER DATABASE $qD SET HADR RESUME;"))
+            } elseif ($rep -and $rep.ConnectedState -eq 'DISCONNECTED') {
+                & $add 'Fix' "Reconnect: start the HADR endpoint on $R" $R 'Only if the endpoint query shows it STOPPED; otherwise check the certificate, the port and the network.' (
+                    @($endpointSql) + @('') + @(& $guard $R @("SELECT 1 FROM sys.database_mirroring_endpoints WHERE state_desc <> 'STARTED'") "The HADR endpoint on $R is already STARTED: the cause is elsewhere.") +
+                    @('ALTER ENDPOINT [Hadr_endpoint] STATE = STARTED;   -- use the endpoint name from the query above'))
+            }
+            & $add 'Verify' "$R keeps moving: three readings, 10 seconds apart" $P $null $sustainedSql
+        }
+        'ReplicaDisconnected' {
+            & $addEv 'Connection' $(if ($rep) { [string]$rep.ConnectedState })
+            & $addEv 'Last connect error' $(if ($rep -and $rep.LastConnectErrorText) { "$($rep.LastConnectError): $($rep.LastConnectErrorText)" })
+            $epRows = @(& $live $R (($endpointSql | Select-Object -Skip 1) -join "`n"))
+            $ep = if ($epRows.Count) { $epRows[0] } else { $null }
+            $epName = if ($ep) { [string]$ep.name } else { 'Hadr_endpoint' }
+            if ($ep) {
+                & $addEv 'Endpoint' ('{0} is {1} on port {2}' -f $ep.name, $ep.state_desc, $ep.port)
+                if ($ep.expiry_date -and -not ($ep.expiry_date -is [DBNull])) {
+                    $days = [int]([datetime]$ep.expiry_date - [datetime]::UtcNow).TotalDays
+                    & $addEv 'Certificate' ('{0} expires {1:yyyy-MM-dd} ({2})' -f $ep.certificate, [datetime]$ep.expiry_date, $(if ($days -lt 0) { 'EXPIRED' } else { "in $days days" }))
+                }
+            } else { & $addEv 'Endpoint' "Could not read it on $R (unreachable from the collector)." }
+            & $add 'Diagnose' 'Connection state and the last connection error of every replica' $P $null $replicaSql
+            & $add 'Diagnose' "The HADR endpoint and its certificate on $R" $R $null $endpointSql
+            & $add 'Fix' "Start the HADR endpoint on $R" $R $(if ($ep -and $ep.state_desc -eq 'STARTED') { 'The endpoint is already STARTED: the cause is elsewhere (certificate, port 5022, firewall, DNS).' }) (
+                @(& $guard $R @("SELECT 1 FROM sys.database_mirroring_endpoints WHERE name = $(& $lit $epName) AND state_desc <> 'STARTED'") "The endpoint $epName on $R is already STARTED: nothing to do.") +
+                @("ALTER ENDPOINT $(& $q $epName) STATE = STARTED;"))
+            & $add 'Verify' "$R is CONNECTED again" $P $null $replicaSql
+        }
+        'ReplicaUnreachable' {
+            & $addEv 'Collector error' $(if ($rep) { [string]$rep.LastConnectErrorText })
+            & $addEv 'What it means' "The monitor cannot open a connection to ${R}: the instance is down, or the network or port is blocked."
+            & $add 'Diagnose' "Can this machine reach $R's port?" 'the monitoring host (PowerShell)' $null @(
+                "Test-NetConnection -ComputerName <$R host> -Port <SQL port>",
+                '# Lab (Docker): is the container running?', 'docker ps --filter "name=agsql"')
+            & $add 'Fix' "Start SQL Server on $R" "$R host (PowerShell)" 'Find out why it stopped first (its error log, Windows event log, or docker logs).' @(
+                '# Windows service:', 'Start-Service -Name MSSQLSERVER        # or MSSQL$<instance>',
+                '# Lab (Docker):', "docker start $R")
+            & $add 'Verify' "$R answers again" $R $null @('SELECT @@SERVERNAME AS server_name, SYSUTCDATETIME() AS now_utc;')
+        }
+        'ReplicaNotHealthy' {
+            & $addEv 'Databases on it' (($Context.Databases | Where-Object ReplicaServerName -eq $R |
+                ForEach-Object { '{0} {1}' -f $_.DatabaseName, $(if ($_.IsSuspended) { 'suspended' } else { ([string]$_.SynchronizationState).ToLower() }) }) -join ', ')
+            & $addEv 'What it means' "Health rolls up from $R's databases and its connection: the database alerts for $R say which one and why."
+            & $add 'Diagnose' 'Connection state of every replica' $P $null $replicaSql
+            & $add 'Diagnose' "What $R reports for each database" $R $null @(
+                'SELECT DB_NAME(database_id) AS database_name, synchronization_state_desc, synchronization_health_desc, is_suspended, suspend_reason_desc',
+                'FROM sys.dm_hadr_database_replica_states WHERE is_local = 1;')
+        }
+        { $_ -in 'LogSendQueueHigh', 'EstimatedDataLossHigh' } {
+            if ($db) {
+                $drain = if ($db.LogSendRateKbSec -gt 0) { 'about ' + (& $fmtSec ([double]$db.LogSendQueueKb / [double]$db.LogSendRateKbSec)) + ' to drain at that rate' } else { 'last reported rate 0' }
+                & $addEv 'Send queue' ('{0}; last reported send rate {1}/s: {2}' -f (& $fmtKb $db.LogSendQueueKb), (& $fmtKb $db.LogSendRateKbSec), $drain)
+            }
+            & $addEv 'Observed movement' $observed
+            & $addEv 'Data at risk (RPO)' (& $rpo $db)
+            $tran = @(& $live $P (($tranSql | Select-Object -Skip 1) -join "`n"))
+            if (-not $tran.Count) { & $addEv 'Largest open transaction' 'None open right now, or not readable from the primary.' }
+            if ($tran.Count) { & $addEv 'Largest open transaction' ('session {0}, {1} from {2} ({3}): {4} MB of log since {5:HH:mm:ss}' -f
+                         $tran[0].session_id, $tran[0].login_name, $tran[0].host_name, $tran[0].program_name, $tran[0].log_mb, $tran[0].transaction_begin_time) }
+            $log = @(& $live $P (($logSql | Select-Object -Skip 2) -join "`n") $D)
+            if ($log.Count) { & $addEv 'Primary log' (& $logLine $log[0] '') }
+            else { & $addEv 'Primary log' (& $notAvailable 'the log space' $P) }
+            & $add 'Diagnose' 'Queues and rates of every replica' $P $null $stateSql
+            & $add 'Diagnose' 'Which transactions are generating the log' $P $null $tranSql
+            & $add 'Diagnose' 'Primary log space' $P $null $logSql
+            & $add 'Verify' "The send queue to $R is shrinking" $P $null $stateSql
+        }
+        { $_ -in 'RedoQueueHigh', 'EstimatedRecoveryHigh' } {
+            if ($db) {
+                $catch = if ($db.RedoRateKbSec -gt 0) { 'about ' + (& $fmtSec ([double]$db.RedoQueueKb / [double]$db.RedoRateKbSec)) + ' to catch up at that rate' } else { 'last reported rate 0' }
+                & $addEv 'Redo queue' ('{0}; last reported redo rate {1}/s: {2}' -f (& $fmtKb $db.RedoQueueKb), (& $fmtKb $db.RedoRateKbSec), $catch)
+                & $addEv 'Observed movement' $observed
+                & $addEv 'Failover time (RTO)' (& $fmtSec $db.EstimatedRecoverySec)
+            }
+            $blk = @(& $live $R (($redoSql | Select-Object -Skip 1) -join "`n"))
+            if ($blk.Count) {
+                $b = $blk[0]
+                & $addEv 'Redo blocked by' ('session {0}: {1} from {2} ({3}), waiting {4} s on {5}' -f $b.blocking_session_id, $b.login_name, $b.host_name, $b.program_name, $b.wait_s, $b.wait_type)
+                & $addEv 'Blocking statement' ([string]$b.blocker_sql)
+            } elseif ($Context.Servers[$R]) { & $addEv 'Redo blocked by' 'nothing right now: look at I/O and CPU on the secondary' }
+            else { & $addEv 'Redo blocked by' (& $notAvailable 'the redo sessions' $R) }
+            & $add 'Diagnose' "Is redo on $R blocked, and by whom?" $R $null $redoSql
+            if ($blk.Count) {
+                $spid = [int]$blk[0].blocking_session_id
+                & $add 'Danger' "End the session that blocks redo on $R" $R 'Ends a user query on the readable secondary. Tell its owner; never automated.' (
+                    @(& $guard $R @("SELECT 1 FROM sys.dm_exec_requests WHERE blocking_session_id = $spid AND command IN ('DB STARTUP', 'PARALLEL REDO TASK', 'PARALLEL REDO HELP TASK')") "Session $spid no longer blocks redo on ${R}: nothing to do.") +
+                    @("KILL $spid;   -- $($blk[0].login_name) from $($blk[0].host_name)"))
+            }
+            & $add 'Verify' "Redo on $R is catching up" $P $null $stateSql
+        }
+        default { return 0 }
+    }
+    & $addEv 'Collected' ('{0:yyyy-MM-dd HH:mm:ss} UTC, when the alert opened' -f [datetime]::UtcNow)
+    Save-AgHealthAlertPlan -Control $Control -AlertId ([long]$Alert.AlertId) -Evidence $ev.ToArray() -Steps $steps.ToArray()
+    $steps.Count
+}
+
 function Invoke-AgHealthCollection {
     <#
     .SYNOPSIS
@@ -543,6 +882,28 @@ UPDATE aghealth.Snapshot SET Status = 'Failed', ErrorMessage = LEFT(@err, 4000),
 
     $servers = @{}
     foreach ($p in @($reached)) { if ($p.Name -and $p.Server) { $servers[$p.Name] = $p.Server } }
+
+    # 5. Evidence and Diagnose / Fix / Verify scripts for every open AG health alert that has none yet.
+    #    Built while the connections are open; a failure here never fails the snapshot.
+    if ($status -eq 'Succeeded') {
+        try {
+            $needPlan = @(Invoke-DbaQuery @control -EnableException -Query @"
+SELECT a.AlertId, r.RuleName, a.ReplicaServerName, a.DatabaseName
+FROM aghealth.Alert a JOIN aghealth.AlertRule r ON r.RuleId = a.RuleId
+WHERE a.State = 'Open' AND a.AgName = @ag AND a.ObjectName = N''
+  AND r.RuleName IN ('DatabaseSuspended', 'SyncSecondaryNotSynced', 'AsyncSecondaryNotMoving', 'ReplicaDisconnected',
+                     'ReplicaUnreachable', 'ReplicaNotHealthy', 'LogSendQueueHigh', 'EstimatedDataLossHigh',
+                     'RedoQueueHigh', 'EstimatedRecoveryHigh')
+  AND NOT EXISTS (SELECT 1 FROM aghealth.AlertScript s WHERE s.AlertId = a.AlertId);
+"@ -SqlParameter @{ ag = $AgName })
+            $context = @{ AgName = $AgName; Primary = $primaryName; Servers = $servers; Replicas = $replicas; Databases = $databases }
+            foreach ($a in $needPlan) {
+                try { $null = New-AgHealthAlertPlan -Alert $a -Context $context -Control $control }
+                catch { Write-Warning "Scripts for alert $($a.AlertId) ($($a.RuleName)) not built: $($_.Exception.Message)" }
+            }
+        }
+        catch { Write-Warning "Alert scripts not built: $($_.Exception.Message)" }
+    }
 
     [pscustomobject]@{
         PSTypeName     = 'AgHealth.Snapshot'
@@ -1254,10 +1615,11 @@ function ConvertTo-AgHealthSlackMessage {
     }
     if ($v.Plan.Count) {
         $lines = foreach ($st in $v.Plan) {
-            $warn = if ($st.Caution -and $st.Stage -in 'CopyBack', 'Decide') { "  :warning: _$($st.Caution)_" } else { '' }
+            $warn = if ($st.Caution -and $st.Stage -in 'CopyBack', 'Decide', 'Fix', 'Danger') { "  :warning: _$($st.Caution)_" } else { '' }
             "$($st.Step). *$($st.Stage)*  $($st.Title)  $dot  ``$($st.RunOn)``$warn"
         }
-        $text = "*Recovery plan*  (scripts ready, nothing has been run)`n" + ($lines -join "`n") +
+        $head = if (@($v.Plan | Where-Object { $_.Stage -in 'Stage', 'CopyBack' }).Count) { 'Recovery plan' } else { 'Diagnose and fix' }
+        $text = "*$head*  (scripts ready, nothing has been run)`n" + ($lines -join "`n") +
                 "`n_Full scripts are in the email digest and on the dashboard._"
         if ($text.Length -gt 2900) { $text = $text.Substring(0, 2900) + ' ...' }
         $blocks.Add(@{ type = 'section'; text = @{ type = 'mrkdwn'; text = $text } })
@@ -1318,8 +1680,10 @@ function ConvertTo-AgHealthEmail {
         $resolution = if ($v.Resolution) {
             "<tr><td colspan='3' style='padding:12px 0 0 0'><div style='background:#ecfdf3;border-radius:6px;padding:8px 12px;font-size:13px;color:#05603a'><b>Resolution</b>&nbsp; $(& $enc $v.Resolution)</div></td></tr>"
         } else { '' }
+        $isRecovery = [bool](@($v.Plan | Where-Object { $_.Stage -in 'Stage', 'CopyBack' }).Count)
         $plan = if ($v.Plan.Count) {
             $stageColor = @{ Prepare = '#475467'; Stage = '#1570ef'; Compare = '#039855'; Decide = '#dc6803'; CopyBack = '#d92d20'
+                             Diagnose = '#039855'; Fix = '#dc6803'; Danger = '#d92d20'
                              Verify = '#039855'; CleanUp = '#475467'; Close = '#475467' }
             $items = foreach ($st in $v.Plan) {
                 $c = if ($stageColor.ContainsKey($st.Stage)) { $stageColor[$st.Stage] } else { '#475467' }
@@ -1337,15 +1701,15 @@ function ConvertTo-AgHealthEmail {
             }
 @"
 <tr><td colspan='3' style='padding:14px 0 0 0'><div style='border-top:1px solid #eaecf0;padding-top:10px'>
-<b style='color:#101828;font-size:13px'>Recovery plan</b>
-<span style='color:#667085;font-size:12px'>&nbsp;Scripts are ready; nothing has been run. Production is never restored over: the restore goes to a standby database.</span>
+<b style='color:#101828;font-size:13px'>$(if ($isRecovery) { 'Recovery plan' } else { 'Diagnose and fix' })</b>
+<span style='color:#667085;font-size:12px'>&nbsp;$(if ($isRecovery) { 'Scripts are ready; nothing has been run. Production is never restored over: the restore goes to a standby database.' } else { 'Scripts are ready, filled in for this AG, replica and database; nothing has been run. Diagnose steps only read.' })</span>
 $($items -join '')
 </div></td></tr>
 "@ } else { '' }
         $runbook = if ($v.Runbook) {
 @"
 <tr><td colspan='3' style='padding:12px 0 0 0'><div style='background:#f9fafb;border-radius:6px;padding:10px 12px;font-size:13px;color:#344054'>
-<b style='color:#101828'>What to check</b><br>$(& $enc $v.Runbook)</div></td></tr>
+<b style='color:#101828'>$(if ($v.Plan.Count) { 'In short' } else { 'What to check' })</b><br>$(& $enc $v.Runbook)</div></td></tr>
 "@ } else { '' }
 @"
 <tr><td style='padding:0 28px 14px 28px'>

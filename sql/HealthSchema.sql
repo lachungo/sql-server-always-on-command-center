@@ -288,9 +288,17 @@ GO
 -- Alert evaluation for one snapshot. Called by the collector after every snapshot.
 --   Opens   : the rule has breached for ConsecutiveSnapshots snapshots in a row (no flapping on one bad reading).
 --   Updates : an open alert stays open while the breach lasts; Warning -> Critical escalates and re-notifies.
---   Resolves: only when the object was measured in this snapshot and is back within the rule.
+--   Resolves: only when the object was measured and back within the rule for ResolveAfterSnapshots snapshots
+--             in a row (default 2), with ResolvedBy = 'measured' and a note saying what was measured.
 --             An object missing from the snapshot (e.g. the collector could not see it) is never "resolved".
 --   Disabled rules resolve their open alerts. AppliesTo mismatches (e.g. a replica switched to async) also resolve.
+-- Closing is measured too: an alert resolves only after this many healthy snapshots in a row (one good reading is not enough)
+IF COL_LENGTH('aghealth.AlertRule', 'ResolveAfterSnapshots') IS NULL
+    ALTER TABLE aghealth.AlertRule ADD ResolveAfterSnapshots tinyint NOT NULL
+        CONSTRAINT DF_AlertRule_ResolveAfter DEFAULT 2
+        CONSTRAINT CK_AlertRule_ResolveAfter CHECK (ResolveAfterSnapshots BETWEEN 1 AND 20);
+GO
+
 CREATE OR ALTER PROCEDURE aghealth.usp_EvaluateAlerts
     @SnapshotId bigint
 AS
@@ -366,8 +374,8 @@ BEGIN
 
     -- The current snapshot, with "has it breached N times in a row" and the alert text
     CREATE TABLE #Now (RuleId int, ReplicaServerName sysname, DatabaseName sysname, Value varchar(60) NULL,
-                       Severity varchar(10) NULL, Qualifies bit, Message nvarchar(1000));
-    INSERT #Now
+                       Severity varchar(10) NULL, Qualifies bit, Message nvarchar(1000), HealthyRun bit);
+    INSERT #Now (RuleId, ReplicaServerName, DatabaseName, Value, Severity, Qualifies, Message, HealthyRun)
     SELECT b.RuleId, b.ReplicaServerName, b.DatabaseName, b.Value, b.Severity,
            CASE WHEN b.Severity IS NOT NULL
                  AND (SELECT COUNT(*) FROM #B h
@@ -383,7 +391,14 @@ BEGIN
                             THEN CONCAT(N' (warn > ', CONVERT(varchar(30), CONVERT(decimal(19,0), ru.WarnThreshold)),
                                         N', critical > ', CONVERT(varchar(30), CONVERT(decimal(19,0), ru.CritThreshold)), N')')
                             ELSE CONCAT(N' (expected ', ru.ExpectedValue, N')') END,
-                       N'. ', ru.Description), 1000)
+                       N'. ', ru.Description), 1000),
+           -- Healthy (measured and within the rule) in each of the last ResolveAfterSnapshots snapshots
+           CASE WHEN b.Severity IS NULL AND b.Value IS NOT NULL
+                 AND (SELECT COUNT(*) FROM #B h
+                      WHERE h.RuleId = b.RuleId AND h.ReplicaServerName = b.ReplicaServerName
+                        AND h.DatabaseName = b.DatabaseName AND h.Severity IS NULL AND h.Value IS NOT NULL
+                        AND h.Seq <= ru.ResolveAfterSnapshots) = ru.ResolveAfterSnapshots
+                THEN 1 ELSE 0 END
     FROM #B b JOIN aghealth.AlertRule ru ON ru.RuleId = b.RuleId
     WHERE b.Seq = 1;
 
@@ -411,13 +426,33 @@ BEGIN
     JOIN #Now n ON n.RuleId = a.RuleId AND n.ReplicaServerName = a.ReplicaServerName AND n.DatabaseName = a.DatabaseName
     WHERE a.State = 'Open' AND a.AgName = @Ag AND n.Severity IS NOT NULL;
 
-    -- Measured now and within the rule: resolve
+    -- Within the rule now, but not yet for long enough: keep open and record the reading
     UPDATE a
-    SET State = 'Resolved', ResolvedAt = @At, LastSnapshotId = @SnapshotId, LastValue = n.Value
+    SET LastSeenAt = @At, LastSnapshotId = @SnapshotId, LastValue = n.Value
+    FROM aghealth.Alert a
+    JOIN #Now n ON n.RuleId = a.RuleId AND n.ReplicaServerName = a.ReplicaServerName AND n.DatabaseName = a.DatabaseName
+    WHERE a.State = 'Open' AND a.AgName = @Ag AND n.Severity IS NULL AND n.HealthyRun = 0;
+
+    -- Healthy for ResolveAfterSnapshots snapshots in a row: resolve, and say what was measured
+    UPDATE a
+    SET State = 'Resolved', ResolvedAt = @At, LastSnapshotId = @SnapshotId, LastValue = n.Value,
+        ResolvedBy = N'measured',
+        ResolutionNote = LEFT(CONCAT(N'Measured: ', ru.Metric, N' = ', n.Value,
+                         CASE WHEN ru.Operator = '>'
+                              THEN CONCAT(N' (warn > ', CONVERT(varchar(30), CONVERT(decimal(19,0), ru.WarnThreshold)), N')')
+                              ELSE CONCAT(N' (expected ', ru.ExpectedValue, N')') END,
+                         CASE WHEN a.ReplicaServerName <> '' THEN N' on ' + a.ReplicaServerName END,
+                         CASE WHEN a.DatabaseName <> '' THEN N'/' + a.DatabaseName END,
+                         N', healthy in ', ru.ResolveAfterSnapshots, N' consecutive snapshots. Open for ',
+                         CASE WHEN DATEDIFF(SECOND, a.FirstSeenAt, @At) < 3600
+                              THEN CONCAT(DATEDIFF(SECOND, a.FirstSeenAt, @At) / 60, N' min')
+                              ELSE CONCAT(DATEDIFF(SECOND, a.FirstSeenAt, @At) / 3600, N' h ',
+                                          DATEDIFF(SECOND, a.FirstSeenAt, @At) % 3600 / 60, N' min') END, N'.'), 400)
     OUTPUT inserted.AlertId, 'Resolved' INTO @Changes
     FROM aghealth.Alert a
     JOIN #Now n ON n.RuleId = a.RuleId AND n.ReplicaServerName = a.ReplicaServerName AND n.DatabaseName = a.DatabaseName
-    WHERE a.State = 'Open' AND a.AgName = @Ag AND n.Severity IS NULL;
+    JOIN aghealth.AlertRule ru ON ru.RuleId = a.RuleId
+    WHERE a.State = 'Open' AND a.AgName = @Ag AND n.Severity IS NULL AND n.HealthyRun = 1;
 
     -- Breached N snapshots in a row and nothing open yet: open
     INSERT aghealth.Alert (RuleId, AgName, ReplicaServerName, DatabaseName, Severity, FirstSeenAt, LastSeenAt,

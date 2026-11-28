@@ -140,10 +140,24 @@ catch {
 Write-Host "    readiness: every secondary is synchronized at the primary's LSN"
 
 # ---- 2. Offline on the old primary, 3. Promote the target, 4. Old primary becomes a secondary -----------
+# Measured RTO starts here: from the moment the AG stops accepting writes on the old primary
+$outage = [Diagnostics.Stopwatch]::StartNew()
 Sql $primary.Instance "ALTER AVAILABILITY GROUP [$AgName] OFFLINE;"
 Write-Host "    offline  : $($primary.Name)"
 Sql $tgt.Instance "ALTER AVAILABILITY GROUP [$AgName] FORCE_FAILOVER_ALLOW_DATA_LOSS;"
 Write-Host "    promoted : $($tgt.Name)"
+# Writable again: every AG database on the new primary is ONLINE and READ_WRITE.
+# Checked every 2 seconds, so the measured time is accurate to about 2 seconds.
+Wait-Until -What "every AG database writable on $($tgt.Name)" -Condition {
+    foreach ($db in $agDbs) {
+        Sql $tgt.Instance "IF ISNULL(CONVERT(nvarchar(30), DATABASEPROPERTYEX(N'$db', 'Status')), N'') <> N'ONLINE'
+                              OR ISNULL(CONVERT(nvarchar(30), DATABASEPROPERTYEX(N'$db', 'Updateability')), N'') <> N'READ_WRITE'
+                               THROW 50200, 'not writable yet', 1;" | Out-Null
+    }
+    $true
+}
+$writable = $outage.Elapsed
+Write-Host ("    writable : {0} after {1:0.0} s (measured RTO: writes unavailable from OFFLINE until here)" -f $tgt.Name, $writable.TotalSeconds)
 # The old primary AND every other secondary must accept the new configuration. The first attempt can fail
 # with Msg 41104 while the transport is stale, so retry until each replica accepts it.
 foreach ($r in $roles | Where-Object Instance -ne $tgt.Instance) {
@@ -223,6 +237,10 @@ catch {
     }
     throw
 }
+
+$outage.Stop()
+Write-Host ("    measured : writes unavailable {0:0.0} s; every replica connected and moving data again after {1:0.0} s" -f
+            $writable.TotalSeconds, $outage.Elapsed.TotalSeconds) -ForegroundColor Green
 
 Sql $tgt.Instance @"
 SELECT ar.replica_server_name AS replica, ars.role_desc AS role,
