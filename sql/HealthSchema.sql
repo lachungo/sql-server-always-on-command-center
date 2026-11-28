@@ -124,6 +124,39 @@ IF COL_LENGTH('aghealth.Alert', 'ResolvedNotifiedAt') IS NULL
     ALTER TABLE aghealth.Alert ADD ResolvedNotifiedAt datetime2(3) NULL;
 GO
 
+-- Object-level alerts (Object Guard): one open alert per object, e.g. 'dbo.TradeLedger'. '' for AG, replica
+-- and database alerts. Resolution can be measured (the object is back) or acknowledged by a person.
+IF COL_LENGTH('aghealth.Alert', 'ObjectName') IS NULL
+    ALTER TABLE aghealth.Alert ADD ObjectName nvarchar(260) NOT NULL CONSTRAINT DF_Alert_Object DEFAULT N'';
+IF COL_LENGTH('aghealth.Alert', 'ResolvedBy') IS NULL
+    ALTER TABLE aghealth.Alert ADD ResolvedBy nvarchar(128) NULL;      -- 'measured' or the person who acknowledged it
+IF COL_LENGTH('aghealth.Alert', 'ResolutionNote') IS NULL
+    ALTER TABLE aghealth.Alert ADD ResolutionNote nvarchar(400) NULL;
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes i
+               JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+               WHERE i.object_id = OBJECT_ID('aghealth.Alert') AND i.name = 'UX_Alert_OneOpen'
+                 AND COL_NAME(ic.object_id, ic.column_id) = 'ObjectName')
+BEGIN
+    IF EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID('aghealth.Alert') AND name = 'UX_Alert_OneOpen')
+        DROP INDEX UX_Alert_OneOpen ON aghealth.Alert;
+    CREATE UNIQUE INDEX UX_Alert_OneOpen ON aghealth.Alert (RuleId, AgName, ReplicaServerName, DatabaseName, ObjectName)
+        WHERE State = 'Open';
+END;
+GO
+
+-- Evidence: facts collected when the alert opened (who, when, from where, rows, recovery point),
+-- so the person on call, or the AI agent, starts from answers instead of a to-do list.
+IF OBJECT_ID('aghealth.AlertEvidence') IS NULL
+CREATE TABLE aghealth.AlertEvidence (
+    AlertId     bigint         NOT NULL CONSTRAINT FK_AlertEvidence_Alert REFERENCES aghealth.Alert(AlertId) ON DELETE CASCADE,
+    SortOrder   int            NOT NULL,
+    Label       nvarchar(60)   NOT NULL,
+    Value       nvarchar(2000) NOT NULL,
+    CollectedAt datetime2(3)   NOT NULL CONSTRAINT DF_AlertEvidence_At DEFAULT SYSUTCDATETIME(),
+    CONSTRAINT PK_AlertEvidence PRIMARY KEY (AlertId, SortOrder));
+GO
+
 -- Reminders: an alert that stays open is announced again, on a schedule, so silence never looks like health.
 -- The schedule is data: a default per severity, optionally overridden per rule (RepeatMinutes 0 = never remind).
 IF COL_LENGTH('aghealth.Alert', 'ReminderCount') IS NULL
@@ -234,6 +267,14 @@ BEGIN
     END;
 
     DELETE aghealth.Alert WHERE State = 'Resolved' AND ResolvedAt < @AlertCutoff;
+
+    -- Object Guard (sql/ObjectGuard.sql): raw events like snapshots, findings like alerts
+    IF OBJECT_ID('aghealth.GuardCapture') IS NOT NULL
+        DELETE aghealth.GuardCapture WHERE CapturedAt < @SnapCutoff;
+    IF OBJECT_ID('aghealth.ObjectEvent') IS NOT NULL
+        DELETE o FROM aghealth.ObjectEvent o
+        WHERE o.DetectedAt < @AlertCutoff
+          AND NOT EXISTS (SELECT 1 FROM aghealth.Alert a WHERE a.AlertId = o.AlertId AND a.State = 'Open');
 END;
 GO
 
@@ -404,9 +445,10 @@ GO
 CREATE OR ALTER VIEW aghealth.PendingNotification
 AS
 -- New, escalated and resolved alerts
-SELECT a.AlertId, a.AgName, a.ReplicaServerName, a.DatabaseName, a.Severity, a.State, r.RuleName,
+SELECT a.AlertId, a.AgName, a.ReplicaServerName, a.DatabaseName, a.ObjectName, a.Severity, a.State, r.RuleName,
        a.LastValue, a.Message, a.FirstSeenAt, a.LastSeenAt, a.ResolvedAt,
        r.Metric, r.Operator, r.ExpectedValue, r.WarnThreshold, r.CritThreshold, r.Description, r.Runbook,
+       a.ResolvedBy, a.ResolutionNote,
        CASE WHEN a.State = 'Open' THEN 'Open:' + a.Severity ELSE 'Resolved' END AS EventKey,
        CASE WHEN a.State = 'Resolved' THEN 'Resolved'
             WHEN EXISTS (SELECT 1 FROM aghealth.Notification n
@@ -425,9 +467,10 @@ WHERE (a.State = 'Open' AND a.NotifiedAt IS NULL)
 UNION ALL
 
 -- Reminders: still open, fully announced, and its next reminder is due
-SELECT a.AlertId, a.AgName, a.ReplicaServerName, a.DatabaseName, a.Severity, a.State, r.RuleName,
+SELECT a.AlertId, a.AgName, a.ReplicaServerName, a.DatabaseName, a.ObjectName, a.Severity, a.State, r.RuleName,
        a.LastValue, a.Message, a.FirstSeenAt, a.LastSeenAt, a.ResolvedAt,
        r.Metric, r.Operator, r.ExpectedValue, r.WarnThreshold, r.CritThreshold, r.Description, r.Runbook,
+       a.ResolvedBy, a.ResolutionNote,
        CONCAT('Reminder:', a.Severity, ':', a.ReminderCount + 1) AS EventKey,
        'Reminder' AS Event,
        a.ReminderCount + 1 AS ReminderNumber, pol.MaxRepeats AS MaxReminders
@@ -503,6 +546,92 @@ BEGIN
 END;
 GO
 
+-- Scripts attached to an alert when it opens: the recovery plan for a dropped object or lost rows, and later
+-- the Diagnose / Fix / Verify steps of every rule. Each step says where it runs and what it changes.
+--   Stage: Prepare | Stage | Compare | Decide | CopyBack | Verify | CleanUp
+IF OBJECT_ID('aghealth.AlertScript') IS NULL
+CREATE TABLE aghealth.AlertScript (
+    AlertId   bigint         NOT NULL CONSTRAINT FK_AlertScript_Alert REFERENCES aghealth.Alert(AlertId) ON DELETE CASCADE,
+    Step      int            NOT NULL,
+    Stage     varchar(20)    NOT NULL,
+    Title     nvarchar(200)  NOT NULL,
+    RunOn     nvarchar(128)  NOT NULL,
+    Caution   nvarchar(400)  NULL,          -- e.g. 'Only after the business confirms the rows must come back'
+    Sql       nvarchar(max)  NOT NULL,
+    CreatedAt datetime2(3)   NOT NULL CONSTRAINT DF_AlertScript_At DEFAULT SYSUTCDATETIME(),
+    CONSTRAINT PK_AlertScript PRIMARY KEY (AlertId, Step));
+GO
+
+-- The business decision on an object alert, recorded before anything is copied back:
+--   Intended : the change was meant to happen (a purge, an archive job). The alert closes now.
+--   Recover  : the data must come back. Approval is recorded on the alert; the copy back follows,
+--              and the alert closes when the guard measures the rows (or the object) back.
+IF OBJECT_ID('aghealth.AlertDecision') IS NULL
+CREATE TABLE aghealth.AlertDecision (
+    DecisionId    bigint IDENTITY CONSTRAINT PK_AlertDecision PRIMARY KEY,
+    AlertId       bigint         NOT NULL CONSTRAINT FK_AlertDecision_Alert REFERENCES aghealth.Alert(AlertId) ON DELETE CASCADE,
+    Decision      varchar(10)    NOT NULL,
+    DecidedBy     nvarchar(128)  NOT NULL,      -- the DBA
+    ConfirmedWith nvarchar(128)  NOT NULL,      -- the business owner who confirmed it
+    Note          nvarchar(400)  NULL,
+    DecidedAt     datetime2(3)   NOT NULL CONSTRAINT DF_AlertDecision_At DEFAULT SYSUTCDATETIME(),
+    CONSTRAINT CK_AlertDecision CHECK (Decision IN ('Intended', 'Recover')));
+GO
+
+CREATE OR ALTER PROCEDURE aghealth.usp_RecordDecision
+    @AlertId       bigint,
+    @Decision      varchar(10),
+    @DecidedBy     nvarchar(128),
+    @ConfirmedWith nvarchar(128),
+    @Note          nvarchar(400) = NULL
+AS
+BEGIN
+    SET NOCOUNT, XACT_ABORT ON;
+    IF @Decision NOT IN ('Intended', 'Recover') THROW 50003, 'Decision must be Intended or Recover.', 1;
+    IF NULLIF(LTRIM(@DecidedBy), N'') IS NULL OR NULLIF(LTRIM(@ConfirmedWith), N'') IS NULL
+        THROW 50004, 'Say who decided and who in the business confirmed it.', 1;
+    IF NOT EXISTS (SELECT 1 FROM aghealth.Alert WHERE AlertId = @AlertId AND State = 'Open')
+        THROW 50002, 'No open alert with that AlertId.', 1;
+
+    DECLARE @text nvarchar(400) = LEFT(CONCAT(
+        CASE @Decision WHEN 'Intended' THEN N'Intended' ELSE N'Recover' END,
+        N': confirmed by ', @DecidedBy, N' with ', @ConfirmedWith,
+        CASE WHEN @Note IS NOT NULL THEN CONCAT(N' (', @Note, N')') END), 400);
+
+    BEGIN TRAN;
+    INSERT aghealth.AlertDecision (AlertId, Decision, DecidedBy, ConfirmedWith, Note)
+    VALUES (@AlertId, @Decision, @DecidedBy, @ConfirmedWith, @Note);
+
+    -- Shown with the alert from now on (evidence lines 13+ are decisions)
+    INSERT aghealth.AlertEvidence (AlertId, SortOrder, Label, Value)
+    SELECT @AlertId, 13 + COUNT(*), N'Decision', CONCAT(@text, N' at ', FORMAT(SYSUTCDATETIME(), 'yyyy-MM-dd HH:mm'), N' UTC')
+    FROM aghealth.AlertEvidence WHERE AlertId = @AlertId AND SortOrder >= 13;
+
+    IF @Decision = 'Intended'
+        UPDATE aghealth.Alert
+        SET State = 'Resolved', ResolvedAt = SYSUTCDATETIME(), ResolvedBy = @DecidedBy, ResolutionNote = @text
+        WHERE AlertId = @AlertId AND State = 'Open';
+    COMMIT;
+    SELECT @AlertId AS AlertId, @Decision AS Decision, @text AS Recorded;
+END;
+GO
+
+-- A person closes an alert that cannot be measured closed (e.g. an approved schema change, a planned purge).
+-- AG health alerts reopen on the next snapshot if the problem is still there, so acknowledging never hides one.
+CREATE OR ALTER PROCEDURE aghealth.usp_ResolveAlert
+    @AlertId    bigint,
+    @ResolvedBy nvarchar(128),
+    @Note       nvarchar(400) = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    UPDATE aghealth.Alert
+    SET State = 'Resolved', ResolvedAt = SYSUTCDATETIME(), ResolvedBy = @ResolvedBy, ResolutionNote = @Note
+    WHERE AlertId = @AlertId AND State = 'Open';
+    IF @@ROWCOUNT = 0 THROW 50002, 'No open alert with that AlertId.', 1;
+END;
+GO
+
 -- Roles: the collector writes, the dashboard reads. Nothing else gets access to this schema.
 IF DATABASE_PRINCIPAL_ID('aghealth_writer') IS NULL CREATE ROLE aghealth_writer;
 IF DATABASE_PRINCIPAL_ID('aghealth_reader') IS NULL CREATE ROLE aghealth_reader;
@@ -511,6 +640,8 @@ GRANT EXECUTE ON aghealth.usp_PurgeHistory         TO aghealth_writer;
 GRANT EXECUTE ON aghealth.usp_EvaluateAlerts       TO aghealth_writer;
 GRANT EXECUTE ON aghealth.usp_RecordNotification   TO aghealth_writer;
 GRANT EXECUTE ON aghealth.usp_CompleteNotification TO aghealth_writer;
+GRANT EXECUTE ON aghealth.usp_ResolveAlert         TO aghealth_writer;
+GRANT EXECUTE ON aghealth.usp_RecordDecision       TO aghealth_writer;
 GRANT SELECT ON SCHEMA::aghealth TO aghealth_reader;
 
 -- The control account already used by AG Sync becomes the collector's writer

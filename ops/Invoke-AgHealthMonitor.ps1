@@ -1,7 +1,8 @@
 <#
 .SYNOPSIS
     One monitoring pass for one Availability Group: collect a health snapshot, evaluate alerts,
-    send notifications, and do the daily upkeep.
+    run Object Guard (dropped objects, unapproved DDL, mass data loss), send notifications,
+    and do the daily upkeep.
 
 .DESCRIPTION
     Built to run every minute from Task Scheduler (see Register-AgHealthMonitor.ps1) or any other scheduler.
@@ -9,6 +10,7 @@
     - One run at a time per AG: a lock file makes an overlapping run skip instead of piling up.
     - Never silent: every run writes to a daily log, and a failure sets a non-zero exit code.
     - Secrets never live in the config file: it only names secrets saved with Save-AgHealthSecret.
+    - Object Guard runs after every successful snapshot; set "Guard": false in the config to turn it off.
     - Daily upkeep: snapshot retention (aghealth.usp_PurgeHistory) once a day, and old logs removed.
 
     Exit codes: 0 ok or skipped, 1 collection failed, 2 a notification channel failed, 3 configuration error.
@@ -94,6 +96,7 @@ try {
     $collect = @{ Replica = @($cfg.Replica); AgName = $cfg.AgName; ControlInstance = $cfg.ControlInstance; ControlDatabase = $controlDb }
     if ($det) { $collect.SqlCredential = $det }
     if ($ctl) { $collect.ControlCredential = $ctl }
+    $s = $null
     try {
         $s = Invoke-AgHealthCollection @collect
         $changes = @($s.Alerts | Where-Object { $_.Change -ne 'Ongoing' })
@@ -110,6 +113,28 @@ try {
     catch {
         Write-MonitorLog ERROR "$($cfg.AgName): collection failed: $($_.Exception.Message)"
         $exitCode = 1
+    }
+
+    # ---- Object Guard: dropped objects, unapproved DDL, mass data loss (on by default) ------------
+    if ($s -and $s.Status -eq 'Succeeded' -and $cfg.Guard -ne $false) {
+        try {
+            $g = Invoke-AgGuardCollection -Snapshot $s -ControlInstance $cfg.ControlInstance -ControlDatabase $controlDb `
+                                          -ControlCredential $ctl -WarningVariable guardWarn -WarningAction SilentlyContinue
+            Write-MonitorLog INFO ("{0}: guard {1} object(s) in {2} database(s), {3} new event(s), {4} finding(s)." -f
+                $cfg.AgName, $g.Objects, $g.Databases.Count, $g.Captured, $g.Findings.Count)
+            foreach ($w in $guardWarn) { Write-MonitorLog WARN "$($cfg.AgName): guard: $w" }
+            foreach ($f in $g.Findings) {
+                $who = if ($f.LoginName -is [DBNull] -or -not $f.LoginName) { 'login not captured' } else { "by $($f.LoginName)" }
+                Write-MonitorLog INFO ("{0}: guard {1} {2}.{3}.{4} {5}" -f $cfg.AgName, $f.EventType, $f.DatabaseName, $f.SchemaName, $f.ObjectName, $who)
+            }
+            foreach ($a in $g.Alerts | Where-Object { $_.Change -ne 'Ongoing' }) {
+                Write-MonitorLog ALERT ("{0}: {1} {2} {3} {4}/{5}" -f $cfg.AgName, $a.Change, $a.Severity, $a.RuleName, $a.DatabaseName, $a.ObjectName)
+            }
+        }
+        catch {
+            Write-MonitorLog ERROR "$($cfg.AgName): guard failed: $($_.Exception.Message)"
+            if ($exitCode -eq 0) { $exitCode = 1 }
+        }
     }
 
     # ---- Notify (also after a failed collection: CollectionFailed is an alert too) ---------------
