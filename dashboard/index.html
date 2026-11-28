@@ -120,6 +120,7 @@
   .spark svg { width: 100%; height: 44px; display: block; }
   .spark .area { fill: #7dd3fc1f; } .spark .ln { fill: none; stroke: var(--log); stroke-width: 1.6; }
   .spark .ln.rpo { stroke: var(--warn); } .spark .area.rpo { fill: #f5b0411a; }
+  .spark .gap { fill: var(--crit); }
   .spark .cap { font-size: 11px; color: var(--faint); margin-top: 3px; display: flex; justify-content: space-between; }
   .spark .note { font-size: 11.5px; color: var(--faint); margin: 10px 0 0; line-height: 1.45; }
   .strip { display: flex; gap: 2px; height: 16px; margin-top: 6px; }
@@ -388,11 +389,17 @@
   // The caption says what the top of the chart means and the peak in the window.
   function sparkline(points, key, cls, floor, fmt) {
     if (points.length < 2) return '<svg viewBox="0 0 300 44"></svg><div class="cap"><span>Not enough snapshots yet</span></div>';
-    const vals = points.map((p) => p[key] ?? 0), peak = Math.max(0, ...vals), max = Math.max(floor || 1, peak), w = 300, h = 44;
-    const xy = vals.map((v, i) => [(i / (vals.length - 1)) * w, h - 3 - (v / max) * (h - 8)]);
-    const line = xy.map((p, i) => (i ? 'L' : 'M') + p[0].toFixed(1) + ',' + p[1].toFixed(1)).join(' ');
-    return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><path class="area ${cls}" d="${line} L${w},${h} L0,${h} Z"/><path class="ln ${cls}" d="${line}"/></svg>
-      <div class="cap"><span>Top of chart ${fmt(max)}</span><span>Peak ${fmt(peak)}</span></div>`;
+    const vals = points.map((p) => p[key] ?? null), known = vals.filter((v) => v != null);
+    const peak = Math.max(0, ...known), max = Math.max(floor || 1, peak), w = 300, h = 44, gaps = vals.length - known.length;
+    const xs = (i) => ((i / (vals.length - 1)) * w).toFixed(1), ys = (v) => (h - 3 - (v / max) * (h - 8)).toFixed(1);
+    // One segment per run of known values; a run of unknowns is a gap, marked along the bottom
+    const runs = []; let cur = null;
+    vals.forEach((v, i) => { if (v == null) { cur = null; return; } if (!cur) runs.push(cur = []); cur.push(i); });
+    const ln = runs.map((r) => r.map((i, k) => (k ? 'L' : 'M') + xs(i) + ',' + ys(vals[i])).join(' ')).join(' ');
+    const area = runs.map((r) => r.map((i, k) => (k ? 'L' : 'M') + xs(i) + ',' + ys(vals[i])).join(' ') + ` L${xs(r[r.length - 1])},${h} L${xs(r[0])},${h} Z`).join(' ');
+    const gapMarks = vals.map((v, i) => v == null ? `<rect class="gap" x="${(+xs(i) - 1.5).toFixed(1)}" y="${h - 3}" width="3" height="3"/>` : '').join('');
+    return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><path class="area ${cls}" d="${area}"/><path class="ln ${cls}" d="${ln}"/>${gapMarks}</svg>
+      <div class="cap"><span>Top of chart ${fmt(max)}${gaps ? `; ${gaps} snapshot${gaps > 1 ? 's' : ''} not reported (gap)` : ''}</span><span>Peak ${fmt(peak)}</span></div>`;
   }
 
   function side(ag, view) {
@@ -424,8 +431,10 @@
     const sparks = sec.map((v) => {
       const pts = ag.trend.filter((t) => t.ReplicaServerName === v.r.ReplicaServerName);
       // One point per snapshot: the worst database of this replica
-      const by = new Map(); pts.forEach((p) => { const o = by.get(p.t) || { t: p.t, q: 0, rpo: 0 };
-        o.q = Math.max(o.q, p.LogSendQueueKb || 0); o.rpo = Math.max(o.rpo, p.EstimatedDataLossSec || 0); by.set(p.t, o); });
+      // A value the primary did not report (e.g. a disconnected replica's send queue) stays null: a gap, never 0
+      const mx = (a, b) => b == null ? a : a == null ? b : Math.max(a, b);
+      const by = new Map(); pts.forEach((p) => { const o = by.get(p.t) || { t: p.t, q: null, rpo: null };
+        o.q = mx(o.q, p.LogSendQueueKb); o.rpo = mx(o.rpo, p.EstimatedDataLossSec); by.set(p.t, o); });
       const series = [...by.values()];
       return `<h3><span>${esc(v.r.ReplicaServerName)}: log not yet sent (send queue)</span><span class="num">${kb(v.sendKb)}</span></h3>${sparkline(series, 'q', '', 1024, kb)}
               <h3><span>${esc(v.r.ReplicaServerName)}: ${v.r.AvailabilityMode === 'SYNCHRONOUS_COMMIT' ? 'data at risk' : 'commit-time lag'}</span><span class="num">${v.rpo == null ? 'unknown' : dur(v.rpo)}</span></h3>${sparkline(series, 'rpo', 'rpo', 30, dur)}`;
