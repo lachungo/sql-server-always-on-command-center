@@ -265,8 +265,11 @@ END
 "@
 
 Import-Module (Join-Path $root 'AgSync.psm1') -Force
+# agsync_apply is sysadmin, and a bulk Apply never sweeps an elevated login along with the others:
+# naming both service accounts is the explicit, reviewed decision that distributes them.
 Invoke-AgSync -Replica $replicas -AgName $AgName -SqlCredential $SaCredential `
-              -ControlInstance $ctl -ControlCredential $ControlCredential -ObjectType Login -Mode Apply |
+              -ControlInstance $ctl -ControlCredential $ControlCredential -ObjectType Login -Mode Apply `
+              -Name agsync_apply, agsync_detect |
     Format-Table ObjectName, TargetReplica, DriftType, Action | Out-String | Write-Host
 
 # msdb is not in the AG, so the detect account's msdb permissions are granted on every replica

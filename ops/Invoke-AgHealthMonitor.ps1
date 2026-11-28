@@ -120,7 +120,15 @@ try {
     }
 
     # ---- Object Guard: dropped objects, unapproved DDL, mass data loss (on by default) ------------
+    $guardInstalled = $false
     if ($s -and $s.Status -eq 'Succeeded' -and $cfg.Guard -ne $false) {
+        try {
+            $guardInstalled = [bool](Invoke-DbaQuery @control -EnableException -Query "SELECT CASE WHEN OBJECT_ID(N'aghealth.usp_GuardEvaluate') IS NULL THEN 0 ELSE 1 END AS ok;").ok
+            if (-not $guardInstalled) { Write-MonitorLog INFO "$($cfg.AgName): Object Guard is not installed (ops/Install-AgGuard.ps1): skipped." }
+        }
+        catch { Write-MonitorLog WARN "$($cfg.AgName): could not check whether Object Guard is installed: $($_.Exception.Message)" }
+    }
+    if ($guardInstalled) {
         try {
             $g = Invoke-AgGuardCollection -Snapshot $s -ControlInstance $cfg.ControlInstance -ControlDatabase $controlDb `
                                           -ControlCredential $ctl -WarningVariable guardWarn -WarningAction SilentlyContinue

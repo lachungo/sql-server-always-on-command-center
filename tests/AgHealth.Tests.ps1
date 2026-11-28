@@ -79,8 +79,21 @@ JOIN sys.availability_groups ag ON ag.group_id = adc.group_id WHERE ag.name = N'
 }
 
 Describe 'Health schema' {
-    It 'ships the 11 default alert rules' {
-        (Invoke-Ctl "SELECT COUNT(*) AS c FROM aghealth.AlertRule WHERE RuleName NOT LIKE 'pt[_]%';").c | Should -Be 11
+    BeforeAll {
+        # The rules HealthSchema.sql ships: 11 AG health rules and 2 replica-drift rules.
+        # (Object Guard adds its own three when it is installed; the CI lab does not install it.)
+        $script:DefaultRules = @('CollectionFailed', 'ReplicaUnreachable', 'ReplicaDisconnected', 'ReplicaNotHealthy',
+            'DatabaseSuspended', 'SyncSecondaryNotSynced', 'AsyncSecondaryNotMoving', 'LogSendQueueHigh', 'RedoQueueHigh',
+            'EstimatedDataLossHigh', 'EstimatedRecoveryHigh', 'MissingOnSecondary', 'OnlyOnSecondary')
+        function Get-DefaultRuleCount {
+            (Invoke-Ctl "SELECT COUNT(*) AS c FROM aghealth.AlertRule WHERE RuleName IN ($(($script:DefaultRules | ForEach-Object { "'$_'" }) -join ', '));").c
+        }
+    }
+    It 'ships the 13 default alert rules' {
+        Get-DefaultRuleCount | Should -Be 13
+    }
+    It 'closes alerts only after 2 healthy snapshots by default' {
+        (Invoke-Ctl "SELECT COUNT(*) AS c FROM aghealth.AlertRule WHERE RuleName NOT LIKE 'pt[_]%' AND ResolveAfterSnapshots <> 2;").c | Should -Be 0
     }
 
     Context 'Re-running the schema script' {
@@ -96,7 +109,9 @@ Describe 'Health schema' {
                 Should -Be 12345
         }
         It 'does not duplicate the default rules' {
-            (Invoke-Ctl "SELECT COUNT(*) AS c FROM aghealth.AlertRule WHERE RuleName NOT LIKE 'pt[_]%';").c | Should -Be 11
+            Get-DefaultRuleCount | Should -Be 13
+            (Invoke-Ctl "SELECT COUNT(*) AS c FROM (SELECT RuleName FROM aghealth.AlertRule GROUP BY RuleName HAVING COUNT(*) > 1) d;").c |
+                Should -Be 0
         }
     }
 }
@@ -393,11 +408,13 @@ WHERE n.AlertId = @id AND n.Channel = 'pt_Email' AND n.EventKey = 'Open:Warning'
             param($Ch, $Ev) Send-AgHealthChannelMessage $Ch $Ev
         }
         $r = $preview.Rendered[0]
-        $r.Slack.Count | Should -Be 11
+        $n = @($rules).Count
+        $n | Should -BeGreaterOrEqual 13
+        $r.Slack.Count | Should -Be $n
         foreach ($json in $r.Slack) { @(($json | ConvertFrom-Json).attachments[0].blocks).Count | Should -BeGreaterThan 2 }
-        $r.Email.Subject | Should -Be "[AG $AgName] 11 Critical"
+        $r.Email.Subject | Should -Be "[AG $AgName] $n Critical"
         $r.Email.Body    | Should -Match 'What to check'
-        $r.Email.Body    | Should -Match '11 Critical'
+        $r.Email.Body    | Should -Match "$n Critical"
         $r.Email.Body    | Should -Match 'pt Brand'                   # company in the header and footer
         $r.Email.Body    | Should -Match 'ops@example.com'
         ($r.Slack[0] | ConvertFrom-Json).attachments[0].blocks[-1].elements[0].text | Should -Match 'pt Brand'
