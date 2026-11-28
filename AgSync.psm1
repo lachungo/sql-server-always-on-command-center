@@ -437,6 +437,38 @@ function Get-AgSyncDatabasePlan {
 
 #region Run logging and execution ---------------------------------------------
 
+# Auto mode: what may be applied without a person, and what waits for one.
+# Anything that grants power, removes something, or rebuilds a login waits for DBA approval.
+$script:ElevatedRoles = @('sysadmin', 'securityadmin', 'serveradmin', 'setupadmin', 'processadmin', 'diskadmin',
+                          'dbcreator', 'bulkadmin', '##MS_LoginManager##', '##MS_DatabaseManager##',
+                          '##MS_ServerStateManager##', '##MS_ServerSecurityStateReader##')
+$script:ElevatedPermissions = @('CONTROL SERVER', 'ALTER ANY LOGIN', 'IMPERSONATE ANY LOGIN', 'ALTER ANY SERVER ROLE',
+                                'ALTER ANY CREDENTIAL', 'ALTER ANY ENDPOINT', 'ALTER ANY CONNECTION', 'ALTER SETTINGS',
+                                'ALTER SERVER STATE', 'SHUTDOWN', 'ALTER ANY DATABASE', 'CREATE ANY DATABASE',
+                                'AUTHENTICATE SERVER', 'EXTERNAL ACCESS ASSEMBLY', 'UNSAFE ASSEMBLY')
+
+function Test-AgSyncAutoPolicy {
+    # $null = may be applied now; otherwise the reason it needs a DBA
+    param($Finding, $Plan)
+    $f = $Finding; $s = $f.SourceObject
+    switch ($f.ObjectType) {
+        'Login' {
+            if ($f.DriftType -eq 'Different' -and 'sid' -in $f.Property) { return 'SID differs: fixing it drops and recreates the login' }
+            $roles = @("$($s.server_roles)" -split ',' | Where-Object { $_ })
+            $perms = @("$($s.server_permissions)" -split ',' | Where-Object { $_ } | ForEach-Object { $_ -replace '^(GRANT|DENY|GRANT_WITH_GRANT_OPTION) ', '' })
+            $hiRoles = @($roles | Where-Object { $_ -in $script:ElevatedRoles })
+            $hiPerms = @($perms | Where-Object { $_ -in $script:ElevatedPermissions })
+            if ($hiRoles.Count -or $hiPerms.Count) {
+                return "elevated login ($((@($hiRoles) + @($hiPerms)) -join ', '))"
+            }
+            return $null
+        }
+        'AgentJob' { return $null }                       # role-aware jobs only: the others were already blocked
+        'Database' { return 'adding a database to the AG starts seeding to every replica' }
+        default    { return 'not covered by the automatic policy' }
+    }
+}
+
 function Start-AgSyncRun {
     param($Ctx, [string] $Mode)
     $cs = $Ctx.Control
@@ -535,7 +567,8 @@ function Invoke-AgSync {
         [Parameter(Mandatory)] [string]       $AgName,
         [Parameter(Mandatory)] [pscredential] $SqlCredential,
         [ValidateSet('Login', 'AgentJob', 'Database')] [string[]] $ObjectType = @('Login', 'AgentJob', 'Database'),
-        [ValidateSet('Detect', 'Apply')]   [string]   $Mode = 'Detect',
+        # Detect: report only. Apply: apply every plan. Auto: apply what the policy allows, the rest waits for a DBA.
+        [ValidateSet('Detect', 'Apply', 'Auto')] [string] $Mode = 'Detect',
         [string] $ControlInstance = 'localhost',
         [string] $ControlDatabase = 'AgSyncControl',
         [pscredential] $ControlCredential
@@ -544,8 +577,8 @@ function Invoke-AgSync {
     $ctx   = New-AgSyncContext $Replica $AgName $SqlCredential $ControlInstance $ControlDatabase $ControlCredential
 
     # Fail fast, before anything is logged or changed
-    if ($Mode -eq 'Apply' -and -not $ctx.CanApply) {
-        throw "Apply refused: the account is not sysadmin on $($ctx.NoApplyOn -join ', '). Use the apply account, or run -Mode Detect."
+    if ($Mode -in 'Apply', 'Auto' -and -not $ctx.CanApply) {
+        throw "$Mode refused: the account is not sysadmin on $($ctx.NoApplyOn -join ', '). Use the apply account, or run -Mode Detect."
     }
 
     $runId = Start-AgSyncRun $ctx $Mode
@@ -567,7 +600,16 @@ function Invoke-AgSync {
                 'Database' { Get-AgSyncDatabasePlan $ctx $f }
             }
 
-            if ($Mode -eq 'Apply' -and $plan.Kind) {
+            if ($Mode -eq 'Auto' -and $plan.Kind) {
+                $why = Test-AgSyncAutoPolicy $f $plan
+                if ($why) {
+                    $plan.Kind   = $null
+                    $plan.Action = 'NeedsApproval'
+                    $plan.Note   = "$($plan.Note); needs DBA approval: $why".TrimStart('; ')
+                }
+            }
+
+            if ($Mode -in 'Apply', 'Auto' -and $plan.Kind) {
                 try {
                     Invoke-AgSyncPlan $ctx $f $plan
                     $plan.Action = 'Applied'

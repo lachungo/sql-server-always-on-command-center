@@ -72,6 +72,13 @@
   .verdict h2 { font-family: var(--display); font-weight: 600; font-size: clamp(19px, 1.8vw, 24px); line-height: 1.2; margin: 0; }
   .verdict h2 .tone-ok { color: var(--ok); } .verdict h2 .tone-warn { color: var(--warn); } .verdict h2 .tone-crit { color: var(--crit); }
   .verdict p { margin: 4px 0 0; color: var(--muted); max-width: 90ch; }
+  .vlist { list-style: none; margin: 10px 0 0; padding: 0; display: grid; gap: 6px; }
+  .vlist li { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; font-size: 13.5px; }
+  .vlist .dot { transform: translateY(-1px); }
+  .vlist b { font-family: var(--display); font-weight: 600; min-width: 64px; }
+  .vlist .mode { color: var(--faint); font-size: 12px; min-width: 92px; }
+  .vlist .say { color: var(--ink); }
+  .vlist .tag { margin-left: 0; }
 
   .grid { display: grid; grid-template-columns: minmax(0, 2.1fr) minmax(300px, 1fr); gap: 16px; }
   .grid-2 { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; margin-top: 16px; }
@@ -246,26 +253,41 @@
                sendRate: worst('LogSendRateKbSec'), rpo: worst('EstimatedDataLossSec'), rto: worst('EstimatedRecoverySec') };
     });
   }
+  // Can each secondary become PRIMARY right now, and at what cost? One line per secondary, worst first.
+  function readiness(ag, v) {
+    const f = (ag.drift.findings || []).filter((x) => x.TargetReplica === v.r.ReplicaServerName && x.Action !== 'Applied');
+    const missing = f.filter((x) => x.DriftType === 'Missing' || x.DriftType === 'Different');
+    const extra = f.filter((x) => x.DriftType === 'ExtraOnTarget');
+    const waiting = f.filter((x) => x.Action === 'NeedsApproval');
+    const sync = v.r.AvailabilityMode === 'SYNCHRONOUS_COMMIT';
+    const allSynced = v.dbs.length && v.dbs.every((d) => d.SynchronizationState === 'SYNCHRONIZED');
+    let tone, say;
+    if (v.down)           { tone = 'crit'; say = 'Cannot become PRIMARY: disconnected or unreachable.'; }
+    else if (v.suspended) { tone = 'crit'; say = 'Cannot become PRIMARY safely: data movement is suspended.'; }
+    else if (sync && allSynced) { tone = missing.length ? 'warn' : 'ok'; say = 'Can become PRIMARY with no data loss.'; }
+    else if (sync)        { tone = 'crit'; say = `Not now: synchronous but not synchronized (${esc(v.states.map(words).join(', '))}). A failover would lose data or be refused.`; }
+    else                  { tone = missing.length ? 'warn' : 'info';
+                            say = `Forced failover only, losing about ${dur(v.rpo)} of committed work. For no data loss, switch it to synchronous commit and wait for synchronized first.`; }
+    const notes = [];
+    if (missing.length) notes.push(`<span class="tag crit">${missing.length} missing: ${missing.slice(0, 2).map((x) => esc(x.ObjectName)).join(', ')}${missing.length > 2 ? ', …' : ''}</span>`);
+    if (waiting.length) notes.push(`<span class="tag warn">${waiting.length} waiting for approval</span>`);
+    if (extra.length)   notes.push(`<span class="tag warn">${extra.length} only on this replica</span>`);
+    return { v, tone, say, notes, missing, sync, ready: !v.down && !v.suspended && sync && allSynced };
+  }
   function verdict(ag, view) {
-    const sec = view.filter((v) => !v.primary);
-    const missing = (name) => ag.drift.findings.filter((f) => f.TargetReplica === name && f.DriftType === 'Missing' && f.Action !== 'Applied');
-    const syncReady = sec.filter((v) => v.r.AvailabilityMode === 'SYNCHRONOUS_COMMIT' && !v.down && !v.suspended
-                                        && v.dbs.length && v.dbs.every((d) => d.SynchronizationState === 'SYNCHRONIZED'));
-    if (!view.some((v) => v.primary)) return { tone: 'crit', h: 'No primary is reporting.', p: ag.snapshot?.ErrorMessage || 'The collector could not find exactly one primary replica.' };
-    if (syncReady.length) {
-      const t = syncReady[0], m = missing(t.r.ReplicaServerName);
-      const lead = `<span class="tone-ok">Failover ready.</span> ${esc(t.r.ReplicaServerName)} can become PRIMARY with no data loss.`;
-      return m.length
-        ? { tone: 'warn', h: lead, p: `But ${m.length} ${m.length === 1 ? 'object is' : 'objects are'} missing there (${m.slice(0, 3).map((f) => esc(f.ObjectName)).join(', ')}${m.length > 3 ? ', …' : ''}): applications that use ${m.length === 1 ? 'it' : 'them'} would break after a failover.` }
-        : { tone: 'ok', h: lead, p: 'Every database on it is synchronized, it is connected, and nothing it needs is missing.' };
+    if (!view.some((v) => v.primary)) return { tone: 'crit', h: 'No primary is reporting.', p: esc(ag.snapshot?.ErrorMessage || 'The collector could not find exactly one primary replica.'), rows: [] };
+    const rows = view.filter((v) => !v.primary).map((v) => readiness(ag, v));
+    const best = rows.find((r) => r.ready && !r.missing.length) || rows.find((r) => r.ready);
+    const order = { crit: 0, warn: 1, info: 2, ok: 3 };
+    rows.sort((a, b) => (b.ready - a.ready) || order[a.tone] - order[b.tone]);
+    if (best) {
+      const h = `<span class="tone-ok">Failover ready.</span> ${esc(best.v.r.ReplicaServerName)} can become PRIMARY with no data loss.`;
+      return best.missing.length
+        ? { tone: 'warn', h, p: `But ${best.missing.length} ${best.missing.length === 1 ? 'login or job is' : 'logins or jobs are'} missing there: applications that use ${best.missing.length === 1 ? 'it' : 'them'} would break after a failover.`, rows }
+        : { tone: 'ok', h, p: 'Synchronized, connected, and nothing it needs is missing.', rows };
     }
-    const reachable = sec.filter((v) => !v.down);
-    if (reachable.length) {
-      const best = reachable.slice().sort((a, b) => a.rpo - b.rpo)[0];
-      return { tone: 'crit', h: `<span class="tone-crit">Not ready for a lossless failover.</span>`,
-               p: `No synchronous secondary is synchronized. Forcing a failover to ${esc(best.r.ReplicaServerName)} now would lose about ${dur(best.rpo)} of committed work.` };
-    }
-    return { tone: 'crit', h: '<span class="tone-crit">No secondary can take over.</span>', p: 'Every secondary is disconnected or unreachable.' };
+    if (rows.some((r) => !r.v.down)) return { tone: 'crit', h: '<span class="tone-crit">Not ready for a lossless failover.</span>', p: 'No synchronous secondary is synchronized right now.', rows };
+    return { tone: 'crit', h: '<span class="tone-crit">No secondary can take over.</span>', p: 'Every secondary is disconnected or unreachable.', rows };
   }
 
   // ---- header and fleet ----------------------------------------------------------------
@@ -439,6 +461,7 @@
     const tag = (r) => {
       if (r.Action === 'Applied') return '<span class="tag ok">copied from primary</span>';
       if (r.Action === 'Failed')  return '<span class="tag crit">copy failed</span>';
+      if (r.Action === 'NeedsApproval') return '<span class="tag warn">waiting for DBA approval</span>';
       return { Missing: '<span class="tag crit">missing here</span>',
                ExtraOnTarget: '<span class="tag warn">only on this replica</span>',
                Different: '<span class="tag warn">differs from primary</span>',
@@ -485,7 +508,10 @@
     $('#main').innerHTML = `${stale}${renderFleet(d)}
       <div class="agtitle"><h1>${esc(ag.displayName)} <span class="kind">Always On availability group</span>${ag.environment ? `<span class="tag">${esc(ag.environment)}</span>` : ''}</h1>
         <p class="facts">${view.length} replicas, ${dbCount} ${dbCount === 1 ? 'database' : 'databases'}, primary ${esc(ag.snapshot.PrimaryReplica || 'none')}. ${ag.alerts.length ? `${ag.alerts.length} open ${ag.alerts.length === 1 ? 'incident' : 'incidents'}.` : 'No open incidents.'}</p></div>
-      <div class="verdict ${v.tone}"><h2>${v.h}</h2><p>${v.p}</p></div>
+      <div class="verdict ${v.tone}"><h2>${v.h}</h2><p>${v.p}</p>
+        ${v.rows.length ? `<ul class="vlist">${v.rows.map((r) => `<li><span class="dot ${r.tone === 'ok' ? 'healthy' : r.tone === 'crit' ? 'critical' : 'warning'}"></span>
+          <b>${esc(r.v.r.ReplicaServerName)}</b><span class="mode">${r.sync ? 'synchronous' : 'asynchronous'}</span>
+          <span class="say">${r.say}</span>${r.notes.join('')}</li>`).join('')}</ul>` : ''}</div>
       <div class="grid"><section class="panel"><h2>Replica topology and log flow</h2><p class="sub">Log flows from the primary, ${esc(ag.snapshot.PrimaryReplica || 'none')}, to each secondary. The dots move faster when more log is moving, and stop when it stops.</p>${topology(view)}${dbTable(view)}</section>${side(ag, view)}</div>
       ${incidents(ag)}
       <div class="grid-2">${timeline(ag)}${drift(ag)}</div>

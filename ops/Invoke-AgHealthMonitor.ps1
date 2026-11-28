@@ -11,7 +11,9 @@
     - Never silent: every run writes to a daily log, and a failure sets a non-zero exit code.
     - Secrets never live in the config file: it only names secrets saved with Save-AgHealthSecret.
     - Object Guard runs after every successful snapshot; set "Guard": false in the config to turn it off.
-    - Replica drift (AG Sync, detect only) every 15 minutes ("DriftEveryMinutes"; 0 turns it off).
+    - Replica drift (AG Sync): with "ApplySecret" in the config, Auto mode every minute: ordinary logins and
+      role-aware jobs are copied at once, elevated logins wait for approval, logins only on a secondary are
+      never touched. Without it, Detect only every 15 minutes ("DriftEveryMinutes"). Drift becomes alerts.
     - The live dashboard's data file is written after every run ("Dashboard": false turns it off).
     - Daily upkeep: snapshot retention (aghealth.usp_PurgeHistory) once a day, and old logs removed.
 
@@ -139,6 +141,52 @@ try {
         }
     }
 
+    # ---- Replica drift (AG Sync) -------------------------------------------------------------------
+    # With an apply secret ("ApplySecret" in the config): Auto mode every AutoSyncEveryMinutes (default 1):
+    #   ordinary logins and role-aware jobs are copied at once; elevated logins and SID rebuilds wait for a DBA;
+    #   anything only on a secondary is never copied or removed.
+    # Without one: Detect only, every DriftEveryMinutes (default 15). Either way, drift becomes alerts.
+    $applyCred = $null
+    if ($cfg.ApplySecret -and $cfg.AutoSync -ne $false) {
+        try { $applyCred = Get-AgHealthSecret $cfg.ApplySecret }
+        catch { Write-MonitorLog WARN "$($cfg.AgName): auto-sync off, apply secret not readable: $($_.Exception.Message)" }
+    }
+    $syncMode   = if ($applyCred) { 'Auto' } else { 'Detect' }
+    $driftEvery = if ($applyCred) { if ($null -ne $cfg.AutoSyncEveryMinutes) { [int]$cfg.AutoSyncEveryMinutes } else { 1 } }
+                  else { if ($null -ne $cfg.DriftEveryMinutes) { [int]$cfg.DriftEveryMinutes } else { 15 } }
+    $syncCred   = if ($applyCred) { $applyCred } else { $det }
+    $driftMark  = Join-Path $LogDirectory "$agTag.lastdrift"
+    $lastDrift  = if (Test-Path $driftMark) { [datetime]::Parse((Get-Content $driftMark -Raw).Trim(), [Globalization.CultureInfo]::InvariantCulture, 'AdjustToUniversal') } else { [datetime]::MinValue }
+    if ($driftEvery -gt 0 -and $syncCred -and $s -and $s.Status -eq 'Succeeded' -and ([datetime]::UtcNow - $lastDrift).TotalMinutes -ge ($driftEvery - 0.25)) {
+        try {
+            # AG Sync lives at the repo root or in an AgSync folder, depending on the checkout
+            $syncModule = @('../AgSync.psm1', '../AgSync/AgSync.psm1') | ForEach-Object { Join-Path $PSScriptRoot $_ } |
+                          Where-Object { Test-Path $_ } | Select-Object -First 1
+            if (-not $syncModule) { throw "AgSync.psm1 not found next to the ops folder (looked in the repo root and in AgSync\)." }
+            Import-Module $syncModule -Force
+            $sync = @{ Replica = @($cfg.Replica); AgName = $cfg.AgName; SqlCredential = $syncCred; Mode = $syncMode
+                       ControlInstance = $cfg.ControlInstance; ControlDatabase = $controlDb }
+            if ($ctl) { $sync.ControlCredential = $ctl }
+            $found = @(Invoke-AgSync @sync -WarningAction SilentlyContinue)
+            Set-Content -Path $driftMark -Value ([datetime]::UtcNow.ToString('o'))
+            $applied = @($found | Where-Object Action -eq 'Applied')
+            $waiting = @($found | Where-Object Action -eq 'NeedsApproval')
+            $failed  = @($found | Where-Object Action -eq 'Failed')
+            $extra   = @($found | Where-Object DriftType -eq 'ExtraOnTarget')
+            Write-MonitorLog INFO ("{0}: drift {1}: {2} finding(s), {3} applied, {4} waiting for approval, {5} only on a secondary, {6} failed." -f
+                $cfg.AgName, $syncMode.ToLower(), $found.Count, $applied.Count, $waiting.Count, $extra.Count, $failed.Count)
+            foreach ($a in $applied) { Write-MonitorLog INFO ("{0}: auto-sync copied {1} {2} to {3}." -f $cfg.AgName, $a.ObjectType, $a.ObjectName, $a.TargetReplica) }
+
+            # Drift as alerts (opens, resolves when the next run no longer finds it)
+            $changes = @(Invoke-DbaQuery @control -EnableException -Query 'EXEC aghealth.usp_DriftEvaluate @AgName = @ag, @SnapshotId = @snap;' `
+                                         -SqlParameter @{ ag = $cfg.AgName; snap = $s.SnapshotId })
+            foreach ($c in $changes) {
+                Write-MonitorLog ALERT ("{0}: {1} {2} {3} {4}/{5}" -f $cfg.AgName, $c.Change, $c.Severity, $c.RuleName, $c.ReplicaServerName, $c.ObjectName)
+            }
+        }
+        catch { Write-MonitorLog WARN "$($cfg.AgName): drift check failed: $($_.Exception.Message)" }
+    }
+
     # ---- Notify (also after a failed collection: CollectionFailed is an alert too) ---------------
     if (@($Channel).Count) {
         try {
@@ -156,28 +204,6 @@ try {
             Write-MonitorLog ERROR "$($cfg.AgName): notification failed: $($_.Exception.Message)"
             if ($exitCode -eq 0) { $exitCode = 2 }
         }
-    }
-
-    # ---- Replica drift (AG Sync, detect only), every DriftEveryMinutes (default 15; 0 = off) -------
-    $driftEvery = if ($null -ne $cfg.DriftEveryMinutes) { [int]$cfg.DriftEveryMinutes } else { 15 }
-    $driftMark  = Join-Path $LogDirectory "$agTag.lastdrift"
-    $lastDrift  = if (Test-Path $driftMark) { [datetime]::Parse((Get-Content $driftMark -Raw).Trim(), [Globalization.CultureInfo]::InvariantCulture, 'AdjustToUniversal') } else { [datetime]::MinValue }
-    if ($driftEvery -gt 0 -and $det -and $s -and $s.Status -eq 'Succeeded' -and ([datetime]::UtcNow - $lastDrift).TotalMinutes -ge $driftEvery) {
-        try {
-            # AG Sync lives at the repo root or in an AgSync folder, depending on the checkout
-            $syncModule = @('../AgSync.psm1', '../AgSync/AgSync.psm1') | ForEach-Object { Join-Path $PSScriptRoot $_ } |
-                          Where-Object { Test-Path $_ } | Select-Object -First 1
-            if (-not $syncModule) { throw "AgSync.psm1 not found next to the ops folder (looked in the repo root and in AgSync\)." }
-            Import-Module $syncModule -Force
-            $sync = @{ Replica = @($cfg.Replica); AgName = $cfg.AgName; SqlCredential = $det; Mode = 'Detect'
-                       ControlInstance = $cfg.ControlInstance; ControlDatabase = $controlDb }
-            if ($ctl) { $sync.ControlCredential = $ctl }
-            $found = @(Invoke-AgSync @sync -WarningAction SilentlyContinue)
-            Set-Content -Path $driftMark -Value ([datetime]::UtcNow.ToString('o'))
-            $missing = @($found | Where-Object DriftType -eq 'Missing').Count
-            Write-MonitorLog INFO ("{0}: drift check {1} finding(s), {2} missing on a secondary." -f $cfg.AgName, $found.Count, $missing)
-        }
-        catch { Write-MonitorLog WARN "$($cfg.AgName): drift check failed: $($_.Exception.Message)" }
     }
 
     # ---- Live dashboard data (every run; a failure never fails the run) --------------------------

@@ -268,6 +268,13 @@ BEGIN
 
     DELETE aghealth.Alert WHERE State = 'Resolved' AND ResolvedAt < @AlertCutoff;
 
+    -- AG Sync history (auto-sync runs every minute): kept like snapshots
+    IF OBJECT_ID('agsync.SyncRun') IS NOT NULL
+    BEGIN
+        DELETE f FROM agsync.DriftFinding f JOIN agsync.SyncRun r ON r.RunId = f.RunId WHERE r.StartedAt < @SnapCutoff;
+        DELETE agsync.SyncRun WHERE StartedAt < @SnapCutoff AND RunId NOT IN (SELECT RunId FROM agsync.DriftFinding);
+    END;
+
     -- Object Guard (sql/ObjectGuard.sql): raw events like snapshots, findings like alerts
     IF OBJECT_ID('aghealth.GuardCapture') IS NOT NULL
         DELETE aghealth.GuardCapture WHERE CapturedAt < @SnapCutoff;
@@ -632,6 +639,110 @@ BEGIN
 END;
 GO
 
+-- Replica drift as alerts, from the latest AG Sync run of each AG (agsync.DriftFinding):
+--   MissingOnSecondary : a login or job on the primary is missing or different on a secondary, and was not
+--                        fixed automatically (elevated, needs approval, or failed). Breaks apps after a failover.
+--   OnlyOnSecondary    : a login or job exists on a secondary but not on the primary (e.g. added directly on a
+--                        reporting replica). Never copied or removed automatically: a person confirms who owns it.
+-- Both resolve when the next AG Sync run no longer finds them.
+INSERT aghealth.AlertRule (RuleName, Scope, Metric, Operator, ExpectedValue, Severity, AppliesTo, ConsecutiveSnapshots, Description, Runbook)
+SELECT v.RuleName, 'Replica', 'DriftState', '<>', 'In sync', v.Sev, 'All', 1, v.Descr, v.Runbook
+FROM (VALUES
+    ('MissingOnSecondary', 'Warning', N'A login or Agent job on the primary is missing or different on this secondary: applications that need it break if this replica becomes PRIMARY',
+     N'Fixed automatically when the policy allows. Otherwise Evidence says why it waits (an elevated login, a SID that differs): confirm with the owner, then run Invoke-AgSync -Mode Apply.'),
+    ('OnlyOnSecondary',    'Warning', N'A login or Agent job exists on this secondary but not on the primary: it was created here directly',
+     N'Find out who created it and why (reporting replicas attract these). Keep it if it belongs only here, create it on the primary if every replica needs it, or remove it.')
+) v(RuleName, Sev, Descr, Runbook)
+WHERE NOT EXISTS (SELECT 1 FROM aghealth.AlertRule r WHERE r.RuleName = v.RuleName);
+GO
+
+CREATE OR ALTER PROCEDURE aghealth.usp_DriftEvaluate
+    @AgName     sysname,
+    @SnapshotId bigint
+AS
+BEGIN
+    SET NOCOUNT, XACT_ABORT ON;
+    IF OBJECT_ID('agsync.SyncRun') IS NULL RETURN;
+    DECLARE @RunId int = (SELECT MAX(RunId) FROM agsync.SyncRun WHERE AgName = @AgName AND Status = 'Succeeded');
+    IF @RunId IS NULL RETURN;
+    DECLARE @At datetime2(3) = SYSUTCDATETIME(), @RunAt datetime2(3), @Mode varchar(10), @Primary sysname,
+            @RMiss int, @ROnly int, @MissOn bit, @OnlyOn bit;
+    SELECT @RunAt = StartedAt, @Mode = Mode, @Primary = PrimaryReplica FROM agsync.SyncRun WHERE RunId = @RunId;
+    SELECT @RMiss = RuleId, @MissOn = IsEnabled FROM aghealth.AlertRule WHERE RuleName = 'MissingOnSecondary';
+    SELECT @ROnly = RuleId, @OnlyOn = IsEnabled FROM aghealth.AlertRule WHERE RuleName = 'OnlyOnSecondary';
+
+    -- What the latest run found and did not fix, one row per replica and object
+    CREATE TABLE #D (RuleId int, Replica sysname, ObjectName nvarchar(260), DriftType varchar(20), Action varchar(20),
+                     Detail nvarchar(4000) NULL, Kind nvarchar(30), Name sysname, PRIMARY KEY (RuleId, Replica, ObjectName));
+    INSERT #D
+    SELECT x.RuleId, x.TargetReplica, x.ObjectName, MAX(x.DriftType), MAX(x.Action), MAX(x.Detail), MAX(x.Kind), MAX(x.Name)
+    FROM (SELECT CASE WHEN f.DriftType = 'ExtraOnTarget' THEN @ROnly ELSE @RMiss END AS RuleId, f.TargetReplica,
+                 CONCAT(CASE f.ObjectType WHEN 'AgentJob' THEN N'Agent job ' ELSE N'Login ' END, f.ObjectName) AS ObjectName,
+                 f.DriftType, f.Action, f.Detail,
+                 CASE f.ObjectType WHEN 'AgentJob' THEN N'Agent job' ELSE N'Login' END AS Kind, f.ObjectName AS Name
+          FROM agsync.DriftFinding f
+          WHERE f.RunId = @RunId AND f.ObjectType IN ('Login', 'AgentJob')
+            AND (f.DriftType = 'ExtraOnTarget' OR (f.DriftType IN ('Missing', 'Different') AND f.Action <> 'Applied'))) x
+    WHERE (x.RuleId = @RMiss AND @MissOn = 1) OR (x.RuleId = @ROnly AND @OnlyOn = 1)
+    GROUP BY x.RuleId, x.TargetReplica, x.ObjectName;
+
+    DECLARE @Changes TABLE (AlertId bigint, Change varchar(12));
+    BEGIN TRAN;
+    UPDATE a SET LastSeenAt = @At, LastSnapshotId = @SnapshotId,
+                 LastValue = CASE WHEN d.Action = 'NeedsApproval' THEN 'Needs approval' ELSE d.DriftType END
+    OUTPUT inserted.AlertId, 'Ongoing' INTO @Changes
+    FROM aghealth.Alert a JOIN #D d ON d.RuleId = a.RuleId AND d.Replica = a.ReplicaServerName AND d.ObjectName = a.ObjectName
+    WHERE a.State = 'Open' AND a.AgName = @AgName AND a.DatabaseName = '';
+
+    INSERT aghealth.Alert (RuleId, AgName, ReplicaServerName, DatabaseName, ObjectName, Severity, FirstSeenAt, LastSeenAt,
+                           OpenSnapshotId, LastSnapshotId, LastValue, Message)
+    OUTPUT inserted.AlertId, 'Opened' INTO @Changes
+    SELECT d.RuleId, @AgName, d.Replica, '', d.ObjectName, 'Warning', @At, @At, @SnapshotId, @SnapshotId,
+           CASE WHEN d.Action = 'NeedsApproval' THEN 'Needs approval' ELSE d.DriftType END,
+           LEFT(CONCAT(CASE WHEN d.RuleId = @RMiss THEN N'MissingOnSecondary' ELSE N'OnlyOnSecondary' END, N' on ', @AgName, N'/', d.Replica, N': ',
+                       d.Kind, N' ', d.Name,
+                       CASE WHEN d.RuleId = @ROnly THEN N' exists here but not on the primary ' + ISNULL(@Primary, N'')
+                            WHEN d.DriftType = 'Different' THEN N' differs from the primary ' + ISNULL(@Primary, N'')
+                            ELSE N' is on the primary ' + ISNULL(@Primary, N'') + N' but missing here' END, N'.'), 1000)
+    FROM #D d
+    WHERE NOT EXISTS (SELECT 1 FROM aghealth.Alert a WHERE a.State = 'Open' AND a.AgName = @AgName AND a.RuleId = d.RuleId
+                         AND a.ReplicaServerName = d.Replica AND a.DatabaseName = '' AND a.ObjectName = d.ObjectName);
+
+    INSERT aghealth.AlertEvidence (AlertId, SortOrder, Label, Value)
+    SELECT c.AlertId, v.SortOrder, v.Label, v.Value
+    FROM @Changes c
+    JOIN aghealth.Alert a ON a.AlertId = c.AlertId
+    JOIN #D d ON d.RuleId = a.RuleId AND d.Replica = a.ReplicaServerName AND d.ObjectName = a.ObjectName
+    CROSS APPLY (VALUES
+        (1, N'What', CONCAT(d.Kind, N' ', d.Name)),
+        (2, N'Replica', d.Replica),
+        (3, N'Primary', @Primary),
+        (4, N'Found', CASE WHEN d.RuleId = @ROnly THEN N'Only on this secondary: created here directly, never on the primary'
+                           WHEN d.DriftType = 'Different' THEN N'Different from the primary'
+                           ELSE N'Missing on this secondary' END),
+        (5, N'Why it matters', CASE WHEN d.RuleId = @ROnly THEN N'Not part of failover: if it matters to an application, that application breaks when another replica becomes PRIMARY; if it should not exist, it is an unmanaged account'
+                                    ELSE N'Applications that use it break if this replica becomes PRIMARY' END),
+        (6, N'AG Sync', CONCAT(d.Action, CASE WHEN NULLIF(d.Detail, N'') IS NOT NULL THEN N': ' + d.Detail END)),
+        (7, N'Checked', CONCAT(FORMAT(@RunAt, 'yyyy-MM-dd HH:mm'), N' UTC, AG Sync run ', @RunId, N' (', @Mode, N')'))
+    ) v(SortOrder, Label, Value)
+    WHERE c.Change = 'Opened' AND v.Value IS NOT NULL;
+
+    -- Measured: the latest run no longer finds it
+    UPDATE a SET State = 'Resolved', ResolvedAt = @At, LastSnapshotId = @SnapshotId, ResolvedBy = N'measured', LastValue = 'In sync',
+                 ResolutionNote = CASE WHEN a.RuleId = @ROnly THEN N'Measured: no longer only on the secondary (created on the primary, or removed).'
+                                       ELSE N'Measured: now in sync with the primary.' END
+    OUTPUT inserted.AlertId, 'Resolved' INTO @Changes
+    FROM aghealth.Alert a
+    WHERE a.State = 'Open' AND a.AgName = @AgName AND a.RuleId IN (@RMiss, @ROnly) AND a.DatabaseName = ''
+      AND NOT EXISTS (SELECT 1 FROM #D d WHERE d.RuleId = a.RuleId AND d.Replica = a.ReplicaServerName AND d.ObjectName = a.ObjectName);
+    COMMIT;
+
+    SELECT c.Change, a.AlertId, a.Severity, r.RuleName, a.ReplicaServerName, a.ObjectName, a.LastValue
+    FROM @Changes c JOIN aghealth.Alert a ON a.AlertId = c.AlertId JOIN aghealth.AlertRule r ON r.RuleId = a.RuleId
+    WHERE c.Change <> 'Ongoing';
+END;
+GO
+
 -- How each AG appears on the dashboard: a friendly name, an environment tag, shown or hidden, and the order.
 -- An AG with no row here is shown, as itself, in the 'Unassigned' environment.
 IF OBJECT_ID('aghealth.AgDisplay') IS NULL
@@ -653,6 +764,7 @@ GRANT EXECUTE ON aghealth.usp_RecordNotification   TO aghealth_writer;
 GRANT EXECUTE ON aghealth.usp_CompleteNotification TO aghealth_writer;
 GRANT EXECUTE ON aghealth.usp_ResolveAlert         TO aghealth_writer;
 GRANT EXECUTE ON aghealth.usp_RecordDecision       TO aghealth_writer;
+GRANT EXECUTE ON aghealth.usp_DriftEvaluate        TO aghealth_writer;
 GRANT SELECT ON SCHEMA::aghealth TO aghealth_reader;
 
 -- The control account already used by AG Sync becomes the collector's writer
