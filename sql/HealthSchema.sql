@@ -632,6 +632,17 @@ BEGIN
 END;
 GO
 
+-- How each AG appears on the dashboard: a friendly name, an environment tag, shown or hidden, and the order.
+-- An AG with no row here is shown, as itself, in the 'Unassigned' environment.
+IF OBJECT_ID('aghealth.AgDisplay') IS NULL
+CREATE TABLE aghealth.AgDisplay (
+    AgName      sysname       NOT NULL CONSTRAINT PK_AgDisplay PRIMARY KEY,
+    DisplayName nvarchar(128) NULL,
+    Environment nvarchar(30)  NULL,          -- e.g. Lab, Pilot, MT, Production
+    IsVisible   bit           NOT NULL CONSTRAINT DF_AgDisplay_Visible DEFAULT 1,
+    SortOrder   int           NOT NULL CONSTRAINT DF_AgDisplay_Sort DEFAULT 100);
+GO
+
 -- Roles: the collector writes, the dashboard reads. Nothing else gets access to this schema.
 IF DATABASE_PRINCIPAL_ID('aghealth_writer') IS NULL CREATE ROLE aghealth_writer;
 IF DATABASE_PRINCIPAL_ID('aghealth_reader') IS NULL CREATE ROLE aghealth_reader;

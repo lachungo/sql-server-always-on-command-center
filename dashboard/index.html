@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Always On Command Center</title>
+<!--
+  Always On Command Center: live dashboard.
+  Reads data.js from this folder (written every minute by ops/Invoke-AgHealthMonitor.ps1 through
+  Export-AgDashboardData) and refreshes it every 15 seconds. No server, no network, nothing to install.
+  Author: Louis Achungo | SQL IT Tech Solutions
+-->
+<style>
+  :root {
+    --base: #0f1a2b; --panel: #15233a; --panel-2: #1b2c47; --line: #263a5a;
+    --ink: #e6edf6; --muted: #8ea0b8; --faint: #5d7090;
+    --log: #7dd3fc; --ok: #2dd4a7; --warn: #f5b041; --crit: #f2545b; --info: #a5b4fc;
+    --display: Bahnschrift, "DIN Alternate", "Segoe UI Semibold", "Arial Narrow", sans-serif;
+    --body: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
+    --mono: "Cascadia Mono", Consolas, "SFMono-Regular", Menlo, monospace;
+    --r-lg: 14px; --r-md: 10px; --r-sm: 6px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--base); color: var(--ink); font: 14px/1.5 var(--body); }
+  body { min-height: 100vh; }
+  a { color: var(--log); }
+  button { font: inherit; color: inherit; }
+  :focus-visible { outline: 2px solid var(--log); outline-offset: 2px; border-radius: 4px; }
+  .num { font-family: var(--display); font-variant-numeric: tabular-nums; letter-spacing: .01em; }
+
+  /* ---- top bar ------------------------------------------------------------------ */
+  header.top { display: flex; align-items: center; gap: 24px; padding: 14px 28px; border-bottom: 1px solid var(--line);
+               background: #0c1524; position: sticky; top: 0; z-index: 5; }
+  .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
+  .brand img { height: 34px; }
+  .brand .co { font-family: var(--display); font-size: 18px; font-weight: 600; line-height: 1.1; white-space: nowrap; }
+  .brand .prod { color: var(--log); font-size: 12.5px; font-family: var(--display); font-stretch: semi-condensed; }
+  nav.ags { display: flex; gap: 6px; flex-wrap: wrap; flex: 1; }
+  nav.ags button { display: flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 999px; cursor: pointer;
+                   background: transparent; border: 1px solid var(--line); color: var(--muted); }
+  nav.ags button[aria-current="true"] { background: var(--panel-2); color: var(--ink); border-color: #3a557f; }
+  nav.ags .env { font-size: 11px; color: var(--faint); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--faint); }
+  .dot.healthy { background: var(--ok); } .dot.warning { background: var(--warn); }
+  .dot.critical { background: var(--crit); } .dot.stale { background: var(--faint); box-shadow: 0 0 0 2px #5d709055; }
+  .live { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12.5px; white-space: nowrap; }
+  .live .beat { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
+  .live.stale .beat { background: var(--warn); }
+
+  main { padding: 22px 28px 40px; max-width: 1560px; margin: 0 auto; }
+  .banner { padding: 10px 14px; border-radius: var(--r-md); margin-bottom: 16px; font-size: 13.5px;
+            background: #3a2a10; color: #ffd89a; border: 1px solid #6b4c17; }
+
+  /* ---- fleet -------------------------------------------------------------------- */
+  .fleet { display: flex; gap: 10px; margin-bottom: 18px; flex-wrap: wrap; }
+  .fleet .card { flex: 0 1 260px; text-align: left; cursor: pointer; padding: 12px 14px; border-radius: var(--r-md);
+                 background: var(--panel); border: 1px solid var(--line); position: relative; }
+  .fleet .card[aria-current="true"] { border-color: var(--log); }
+  .fleet .card .n { font-family: var(--display); font-size: 16px; display: flex; align-items: center; gap: 8px; }
+  .fleet .card .m { color: var(--muted); font-size: 12.5px; }
+  .fleet .hide { position: absolute; top: 8px; right: 8px; background: none; border: 0; color: var(--faint); cursor: pointer; font-size: 12px; }
+  .fleet .hidden-list { align-self: center; color: var(--muted); font-size: 12.5px; }
+  .fleet .hidden-list button { background: none; border: 0; color: var(--log); cursor: pointer; padding: 0 4px; }
+
+  /* ---- verdict + hero ----------------------------------------------------------- */
+  .agtitle { margin: 2px 0 14px; }
+  .agtitle h1 { font-family: var(--display); font-weight: 600; font-size: clamp(28px, 3vw, 38px); line-height: 1.1; margin: 0; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .agtitle h1 .kind { font-weight: 400; color: var(--muted); font-size: .62em; }
+  .agtitle .facts { color: var(--muted); margin: 4px 0 0; }
+  .verdict { border-left: 4px solid var(--ok); background: var(--panel); border-radius: 0 var(--r-md) var(--r-md) 0; padding: 12px 18px; margin: 0 0 16px; }
+  .verdict.warn { border-left-color: var(--warn); } .verdict.crit { border-left-color: var(--crit); }
+  .verdict h2 { font-family: var(--display); font-weight: 600; font-size: clamp(19px, 1.8vw, 24px); line-height: 1.2; margin: 0; }
+  .verdict h2 .tone-ok { color: var(--ok); } .verdict h2 .tone-warn { color: var(--warn); } .verdict h2 .tone-crit { color: var(--crit); }
+  .verdict p { margin: 4px 0 0; color: var(--muted); max-width: 90ch; }
+
+  .grid { display: grid; grid-template-columns: minmax(0, 2.1fr) minmax(300px, 1fr); gap: 16px; }
+  .grid-2 { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; margin-top: 16px; }
+  section.panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-lg); padding: 18px 20px; min-width: 0; }
+  section.panel > h2 { font-family: var(--display); font-weight: 600; font-size: 16px; margin: 0 0 2px; }
+  section.panel > .sub { color: var(--muted); font-size: 12.5px; margin: 0 0 14px; }
+
+  .topo { width: 100%; height: auto; display: block; }
+  .topo .node rect { fill: var(--panel-2); stroke: var(--line); stroke-width: 1.2; }
+  .topo .node.primary rect { stroke: var(--log); stroke-width: 1.6; }
+  .topo .node.bad rect { stroke: var(--crit); }
+  .topo .node.warnish rect { stroke: var(--warn); }
+  .topo text { fill: var(--ink); font-family: var(--body); }
+  .topo .nm { font-family: var(--display); font-size: 17px; font-weight: 600; }
+  .topo .role { font-size: 11.5px; fill: var(--muted); }
+  .topo .kv { font-size: 12px; fill: var(--muted); }
+  .topo .kv tspan.v { fill: var(--ink); font-family: var(--display); }
+  .topo .link { fill: none; stroke: #2f4a73; stroke-width: 2.4; }
+  .topo .link.sync { stroke: #3c6aa6; }
+  .topo .link.down { stroke: var(--crit); stroke-dasharray: 6 6; }
+  .topo .link.lag { stroke: var(--warn); }
+  .topo .packet { fill: var(--log); }
+  .topo .lbl { font-size: 11.5px; fill: var(--muted); }
+  .topo .lbl tspan.v { fill: var(--ink); font-family: var(--display); }
+  table.dbs { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 14px; }
+  table.dbs th { text-align: left; color: var(--muted); font-weight: 500; font-size: 12px; padding: 6px 10px 6px 0; border-bottom: 1px solid var(--line); }
+  table.dbs td { padding: 7px 10px 7px 0; border-bottom: 1px solid #1f3150; }
+  table.dbs td.r, table.dbs th.r { text-align: right; }
+  table.dbs td .num { font-size: 14px; }
+  .st { display: inline-flex; align-items: center; gap: 6px; }
+
+  .kpis { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .kpi { background: var(--panel-2); border-radius: var(--r-md); padding: 12px 14px; }
+  .kpi .v { font-family: var(--display); font-size: 26px; line-height: 1.1; }
+  .kpi .l { color: var(--muted); font-size: 12px; }
+  .kpi.crit .v { color: var(--crit); } .kpi.warn .v { color: var(--warn); } .kpi.ok .v { color: var(--ok); }
+  .spark { margin-top: 14px; }
+  .spark h3 { font-size: 12.5px; color: var(--muted); font-weight: 500; margin: 12px 0 4px; display: flex; justify-content: space-between; }
+  .spark svg { width: 100%; height: 44px; display: block; }
+  .spark .area { fill: #7dd3fc1f; } .spark .ln { fill: none; stroke: var(--log); stroke-width: 1.6; }
+  .spark .ln.rpo { stroke: var(--warn); } .spark .area.rpo { fill: #f5b0411a; }
+  .strip { display: flex; gap: 2px; height: 16px; margin-top: 6px; }
+  .strip i { flex: 1; border-radius: 2px; background: var(--ok); opacity: .75; }
+  .strip i.Failed { background: var(--crit); opacity: 1; } .strip i.Partial { background: var(--warn); opacity: 1; }
+
+  /* ---- incidents ---------------------------------------------------------------- */
+  .incidents { margin-top: 16px; }
+  .inc { border: 1px solid var(--line); border-left: 4px solid var(--warn); border-radius: var(--r-md); background: var(--panel-2); margin-top: 10px; }
+  .inc.Critical { border-left-color: var(--crit); }
+  .inc > button.head { width: 100%; display: grid; grid-template-columns: auto 1fr auto; gap: 14px; align-items: center;
+                       padding: 12px 16px; background: none; border: 0; cursor: pointer; text-align: left; }
+  .sev { font-family: var(--display); font-size: 12px; padding: 2px 8px; border-radius: var(--r-sm); background: var(--warn); color: #1d1405; }
+  .Critical .sev { background: var(--crit); color: #fff; }
+  .inc .t { font-family: var(--display); font-size: 16px; }
+  .inc .p { color: var(--muted); font-family: var(--mono); font-size: 12px; }
+  .inc .when { color: var(--muted); font-size: 12.5px; text-align: right; white-space: nowrap; }
+  .inc .when b { color: var(--ink); font-family: var(--display); font-weight: 500; }
+  .inc .body { padding: 0 16px 16px; display: none; }
+  .inc.open .body { display: block; }
+  .inc .msg { color: var(--muted); margin: 0 0 10px; }
+  .ev { display: grid; grid-template-columns: 150px 1fr; gap: 4px 14px; font-size: 13px; margin: 0 0 12px; }
+  .ev dt { color: var(--muted); } .ev dd { margin: 0; overflow-wrap: anywhere; }
+  .ev dd code { font-family: var(--mono); font-size: 12px; background: #0f1a2b; padding: 2px 6px; border-radius: 4px; }
+  .check { background: #0f1a2b; border-radius: var(--r-sm); padding: 10px 12px; font-size: 13px; margin-bottom: 12px; }
+  .check b { font-weight: 600; }
+  .plan h4 { font-family: var(--display); font-weight: 600; font-size: 14px; margin: 14px 0 2px; }
+  .plan .note { color: var(--muted); font-size: 12.5px; margin: 0 0 8px; }
+  .step { margin-top: 10px; }
+  .step .sh { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .stage { font-family: var(--display); font-size: 12px; padding: 1px 8px; border-radius: var(--r-sm); background: #3b4d6b; }
+  .stage.Stage { background: #1d5fb8; } .stage.Compare, .stage.Verify { background: #12795f; }
+  .stage.Decide { background: #a8670b; } .stage.CopyBack { background: #b3343a; }
+  .step .ttl { font-weight: 600; } .step .on { color: var(--muted); font-size: 12.5px; }
+  .step .caution { color: #ffd89a; font-size: 12.5px; margin: 4px 0 0; }
+  .code { position: relative; margin-top: 6px; }
+  .code pre { margin: 0; background: #0a1220; border: 1px solid #1f3150; border-radius: var(--r-sm); padding: 10px 12px; max-height: 300px; overflow: auto;
+              font: 12px/1.5 var(--mono); color: #d6e2f0; white-space: pre; }
+  .code button { position: absolute; top: 6px; right: 6px; background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--r-sm);
+                 padding: 2px 10px; font-size: 12px; cursor: pointer; color: var(--muted); }
+  .code button.done { color: var(--ok); border-color: var(--ok); }
+  .empty { color: var(--muted); padding: 6px 0; }
+  .empty b { color: var(--ok); font-weight: 600; }
+
+  /* ---- timeline / drift / resolved ---------------------------------------------- */
+  ol.tl { list-style: none; margin: 0; padding: 0; }
+  ol.tl li { display: grid; grid-template-columns: 28px 1fr auto; gap: 10px; padding: 9px 0; border-top: 1px solid var(--line); }
+  ol.tl li:first-child { border-top: 0; }
+  .glyph { width: 24px; height: 24px; border-radius: 50%; display: grid; place-items: center; font-size: 13px; font-weight: 700; background: #24395c; }
+  .glyph.Dropped, .glyph.DataLoss { background: #4a1f27; color: var(--crit); }
+  .glyph.Created, .glyph.Altered { background: #2b2f5c; color: var(--info); }
+  .glyph.Restored { background: #123d35; color: var(--ok); }
+  ol.tl .what { font-size: 13.5px; } ol.tl .who { color: var(--muted); font-size: 12.5px; }
+  ol.tl .tm { color: var(--muted); font-size: 12.5px; white-space: nowrap; }
+  .note { color: var(--muted); font-size: 12.5px; margin: 0 0 6px; }
+  .tag { white-space: nowrap; display: inline-block; font-size: 11.5px; padding: 0 7px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); margin-left: 6px; }
+  .tag.ok { color: var(--ok); border-color: #1e6e5a; } .tag.crit { color: var(--crit); border-color: #7a2a31; } .tag.warn { color: var(--warn); border-color: #7a5a1e; }
+  .drift-group { margin-bottom: 12px; }
+  .drift-group h3 { font-family: var(--display); font-weight: 600; font-size: 14px; margin: 0 0 6px; }
+  table.dr { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.dr td { padding: 5px 0; border-top: 1px solid var(--line); vertical-align: top; }
+  table.dr td:first-child { color: var(--muted); width: 90px; }
+  table.dr td:last-child { text-align: right; width: 110px; }
+  table.dr td.nm { font-family: var(--mono); font-size: 12.5px; }
+  ol.tl.res li { grid-template-columns: minmax(0, 1fr) auto; }
+  footer { color: var(--faint); font-size: 12.5px; text-align: center; padding: 24px; }
+  footer b { color: var(--muted); font-weight: 600; }
+
+  .onboard { max-width: 720px; margin: 10vh auto; background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-lg); padding: 28px 32px; }
+  .onboard h1 { font-family: var(--display); font-weight: 600; margin: 0 0 8px; }
+  .onboard pre { background: #0a1220; padding: 12px; border-radius: var(--r-sm); font: 12.5px/1.5 var(--mono); overflow: auto; }
+
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 #f2545b88; } 100% { box-shadow: 0 0 0 14px #f2545b00; } }
+  .inc.fresh { animation: pulse 1.4s ease-out 2; }
+  @media (max-width: 1100px) { .grid, .grid-2 { grid-template-columns: 1fr; } }
+  @media (max-width: 640px) { header.top { flex-wrap: wrap; padding: 12px 16px; } main { padding: 16px; }
+    .ev { grid-template-columns: 1fr; } .inc > button.head { grid-template-columns: auto 1fr; } .inc .when { grid-column: 1 / -1; text-align: left; } }
+  @media (prefers-reduced-motion: reduce) { .topo .packet { display: none; } .inc.fresh { animation: none; } }
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="brand" id="brand"></div>
+  <nav class="ags" id="agnav" aria-label="Availability groups"></nav>
+  <div class="live" id="live"><span class="beat"></span><span id="livetext">Waiting for data</span></div>
+</header>
+<main id="main"></main>
+<footer id="foot"></footer>
+
+<script>
+(() => {
+  'use strict';
+  const REFRESH_MS = 15000, STALE_MIN = 3;
+  const $ = (s) => document.querySelector(s);
+  const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const store = {
+    get(k, d) { try { const v = localStorage.getItem('aocc.' + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
+    set(k, v) { try { localStorage.setItem('aocc.' + k, JSON.stringify(v)); } catch { /* storage unavailable: keep in memory */ } }
+  };
+  const state = { data: null, ag: store.get('ag', null), hidden: new Set(store.get('hidden', [])), open: new Set(), seen: new Set(), first: true };
+
+  // ---- formatting -----------------------------------------------------------------
+  const kb = (v) => v == null ? '–' : v >= 1048576 ? (v / 1048576).toFixed(1) + ' GB' : v >= 1024 ? (v / 1024).toFixed(1) + ' MB' : Math.round(v) + ' KB';
+  const dur = (s) => { if (s == null) return '–'; s = Math.max(0, Math.round(s));
+    if (s < 60) return s + ' s'; if (s < 3600) return Math.floor(s / 60) + ' min' + (s % 60 && s < 600 ? ' ' + (s % 60) + ' s' : '');
+    if (s < 86400) return Math.floor(s / 3600) + ' h ' + Math.floor((s % 3600) / 60) + ' min'; return Math.floor(s / 86400) + ' d ' + Math.floor((s % 86400) / 3600) + ' h'; };
+  const ms = (iso) => iso ? Date.parse(iso) : NaN;
+  const ago = (iso) => { const t = ms(iso); return isNaN(t) ? '–' : dur((Date.now() - t) / 1000) + ' ago'; };
+  const hhmm = (iso) => { const d = new Date(ms(iso)); return isNaN(d) ? '–' : d.toISOString().slice(11, 16) + ' UTC'; };
+  const n0 = (v) => v == null ? '–' : Number(v).toLocaleString('en-US');
+  const short = (mode) => mode === 'SYNCHRONOUS_COMMIT' ? 'synchronous' : mode === 'ASYNCHRONOUS_COMMIT' ? 'asynchronous' : (mode || 'unknown').toLowerCase();
+  const words = (v) => (v || '').toString().replace(/_/g, ' ').toLowerCase();
+
+  // ---- rollups ----------------------------------------------------------------------
+  function agStatus(ag) {
+    const age = (Date.now() - ms(ag.snapshot?.CollectedAt)) / 60000;
+    if (!(age < STALE_MIN)) return 'stale';
+    if (ag.snapshot?.Status === 'Failed' || ag.alerts.some((a) => a.Severity === 'Critical')) return 'critical';
+    if (ag.alerts.length) return 'warning';
+    return 'healthy';
+  }
+  function replicaView(ag) {
+    return ag.replicas.map((r) => {
+      const dbs = ag.databases.filter((d) => d.ReplicaServerName === r.ReplicaServerName);
+      const worst = (f) => dbs.reduce((m, d) => Math.max(m, d[f] ?? 0), 0);
+      const suspended = dbs.some((d) => d.IsSuspended);
+      const states = [...new Set(dbs.map((d) => d.SynchronizationState).filter(Boolean))];
+      const primary = r.Role === 'PRIMARY';
+      const down = !r.IsReachable || r.ConnectedState === 'DISCONNECTED';
+      const alerts = ag.alerts.filter((a) => a.ReplicaServerName === r.ReplicaServerName);
+      const sev = alerts.some((a) => a.Severity === 'Critical') || down || suspended ? 'bad' : alerts.length || r.SynchronizationHealth !== 'HEALTHY' ? 'warnish' : '';
+      return { r, dbs, primary, down, suspended, states, sev, sendKb: worst('LogSendQueueKb'), redoKb: worst('RedoQueueKb'),
+               sendRate: worst('LogSendRateKbSec'), rpo: worst('EstimatedDataLossSec'), rto: worst('EstimatedRecoverySec') };
+    });
+  }
+  function verdict(ag, view) {
+    const sec = view.filter((v) => !v.primary);
+    const missing = (name) => ag.drift.findings.filter((f) => f.TargetReplica === name && f.DriftType === 'Missing' && f.Action !== 'Applied');
+    const syncReady = sec.filter((v) => v.r.AvailabilityMode === 'SYNCHRONOUS_COMMIT' && !v.down && !v.suspended
+                                        && v.dbs.length && v.dbs.every((d) => d.SynchronizationState === 'SYNCHRONIZED'));
+    if (!view.some((v) => v.primary)) return { tone: 'crit', h: 'No primary is reporting.', p: ag.snapshot?.ErrorMessage || 'The collector could not find exactly one primary replica.' };
+    if (syncReady.length) {
+      const t = syncReady[0], m = missing(t.r.ReplicaServerName);
+      const lead = `<span class="tone-ok">Failover ready.</span> ${esc(t.r.ReplicaServerName)} can become PRIMARY with no data loss.`;
+      return m.length
+        ? { tone: 'warn', h: lead, p: `But ${m.length} ${m.length === 1 ? 'object is' : 'objects are'} missing there (${m.slice(0, 3).map((f) => esc(f.ObjectName)).join(', ')}${m.length > 3 ? ', …' : ''}): applications that use ${m.length === 1 ? 'it' : 'them'} would break after a failover.` }
+        : { tone: 'ok', h: lead, p: 'Every database on it is synchronized, it is connected, and nothing it needs is missing.' };
+    }
+    const reachable = sec.filter((v) => !v.down);
+    if (reachable.length) {
+      const best = reachable.slice().sort((a, b) => a.rpo - b.rpo)[0];
+      return { tone: 'crit', h: `<span class="tone-crit">Not ready for a lossless failover.</span>`,
+               p: `No synchronous secondary is synchronized. Forcing a failover to ${esc(best.r.ReplicaServerName)} now would lose about ${dur(best.rpo)} of committed work.` };
+    }
+    return { tone: 'crit', h: '<span class="tone-crit">No secondary can take over.</span>', p: 'Every secondary is disconnected or unreachable.' };
+  }
+
+  // ---- header and fleet ----------------------------------------------------------------
+  function renderHeader(d) {
+    const b = d.brand || {};
+    $('#brand').innerHTML = `${b.logo ? `<img src="${esc(b.logo)}" alt="">` : ''}<div><div class="co">${esc(b.name || b.product)}</div><div class="prod">${esc(b.product || 'Always On Command Center')}</div></div>`;
+    const age = (Date.now() - ms(d.generatedAt)) / 60000;
+    $('#live').classList.toggle('stale', !(age < STALE_MIN));
+    $('#livetext').textContent = `Updated ${ago(d.generatedAt)}`;
+    const vis = d.ags.filter((a) => !state.hidden.has(a.name) && a.visible);
+    $('#agnav').innerHTML = vis.map((a) => `<button type="button" data-ag="${esc(a.name)}" aria-current="${a.name === state.ag}">
+        <span class="dot ${agStatus(a)}"></span>${esc(a.displayName)}${a.environment ? `<span class="env">${esc(a.environment)}</span>` : ''}</button>`).join('');
+    $('#foot').innerHTML = `<b>${esc(b.name || '')}</b>${b.tagline ? ` &nbsp;&ldquo;${esc(b.tagline)}&rdquo;` : ''}${b.url ? ` &nbsp;<a href="${esc(b.url)}">${esc(b.url.replace(/^https?:\/\//, ''))}</a>` : ''}`;
+  }
+  function renderFleet(d) {
+    const vis = d.ags.filter((a) => !state.hidden.has(a.name) && a.visible);
+    const hidden = d.ags.filter((a) => state.hidden.has(a.name));
+    if (vis.length < 2 && !hidden.length) return '';
+    const cards = vis.map((a) => {
+      const st = agStatus(a), crit = a.alerts.filter((x) => x.Severity === 'Critical').length;
+      return `<div class="card" role="button" tabindex="0" data-ag="${esc(a.name)}" aria-current="${a.name === state.ag}">
+        <button class="hide" type="button" data-hide="${esc(a.name)}" aria-label="Hide ${esc(a.displayName)}">Hide</button>
+        <div class="n"><span class="dot ${st}"></span>${esc(a.displayName)}</div>
+        <div class="m">${a.environment ? esc(a.environment) + ' &nbsp;|&nbsp; ' : ''}primary ${esc(a.snapshot.PrimaryReplica || 'none')} &nbsp;|&nbsp; ${a.replicas.length} replicas</div>
+        <div class="m">${a.alerts.length ? `${a.alerts.length} open${crit ? `, ${crit} critical` : ''}` : 'No open alerts'}</div></div>`;
+    }).join('');
+    const hid = hidden.length ? `<div class="hidden-list">Hidden: ${hidden.map((a) => `<button type="button" data-show="${esc(a.name)}">${esc(a.displayName)}</button>`).join(', ')}</div>` : '';
+    return `<div class="fleet">${cards}${hid}</div>`;
+  }
+
+  // ---- topology: the replicas, and the log flowing between them --------------------------
+  function topology(view) {
+    const pri = view.find((v) => v.primary) || view[0];
+    const secs = view.filter((v) => v !== pri);
+    const W = 940, nodeW = 250, nodeH = 112, gap = 26;
+    const H = Math.max(nodeH + 40, secs.length * (nodeH + gap) - gap + 40);
+    const px = 28, py = (H - nodeH) / 2, sx = W - nodeW - 28;
+    const node = (v, x, y) => {
+      const db = v.dbs.length === 1 ? words(v.dbs[0].SynchronizationState) : v.states.map(words).join(', ') || '–';
+      const role = v.primary ? 'Primary' : `Secondary, ${short(v.r.AvailabilityMode)}`;
+      const health = v.down ? 'unreachable' : v.suspended ? 'suspended' : words(v.r.SynchronizationHealth);
+      return `<g class="node ${v.primary ? 'primary' : ''} ${v.sev}" transform="translate(${x},${y})">
+        <rect width="${nodeW}" height="${nodeH}" rx="12"/>
+        <text class="nm" x="16" y="30">${esc(v.r.ReplicaServerName)}</text>
+        <text class="role" x="16" y="48">${esc(role)}, ${esc(words(v.r.FailoverMode))} failover</text>
+        <text class="kv" x="16" y="72">Health <tspan class="v">${esc(health)}</tspan></text>
+        <text class="kv" x="16" y="92">${v.primary ? 'Databases' : 'Data'} <tspan class="v">${esc(v.primary ? v.dbs.length + ' in the AG' : db)}</tspan></text>
+      </g>`;
+    };
+    let links = '', packets = '', labels = '';
+    secs.forEach((v, i) => {
+      const y = 20 + i * (nodeH + gap);
+      const x1 = px + nodeW, y1 = py + nodeH / 2, x2 = sx, y2 = y + nodeH / 2, mx = x1 + (x2 - x1) * 0.42;
+      // Curve out of the primary, then run level for the last stretch into the secondary (room for labels)
+      const lv = x2 - 170;
+      const d = `M${x1},${y1} C${mx},${y1} ${mx},${y2} ${lv},${y2} L${x2},${y2}`;
+      const cls = v.down || v.suspended ? 'down' : v.sendKb > 102400 || v.rpo > 60 ? 'lag' : v.r.AvailabilityMode === 'SYNCHRONOUS_COMMIT' ? 'sync' : '';
+      links += `<path class="link ${cls}" d="${d}"/>`;
+      if (!v.down && !v.suspended) {
+        // Packets: faster when log moves faster, more of them when a queue is building
+        const speed = Math.max(1.2, 4.2 - Math.log10(1 + (v.sendRate || 0)));
+        const count = v.sendKb > 1024 ? 4 : 2;
+        for (let k = 0; k < count; k++) {
+          packets += `<circle class="packet" r="3.4"><animateMotion dur="${speed.toFixed(2)}s" begin="${(k * speed / count).toFixed(2)}s" repeatCount="indefinite" path="${d}"/></circle>`;
+        }
+      }
+      // Labels sit just before the secondary, above and below the line where it runs level
+      const lx = x2 - 14;
+      labels += `<text class="lbl" x="${lx}" y="${y2 - 9}" text-anchor="end">${v.down ? 'disconnected' : v.suspended ? 'data movement suspended' : `queued <tspan class="v">${kb(v.sendKb)}</tspan>`}</text>
+                 <text class="lbl" x="${lx}" y="${y2 + 19}" text-anchor="end">RPO <tspan class="v">${dur(v.rpo)}</tspan> &#160; RTO <tspan class="v">${dur(v.rto)}</tspan></text>`;
+    });
+    const nodes = node(pri, px, py) + secs.map((v, i) => node(v, sx, 20 + i * (nodeH + gap))).join('');
+    return `<svg class="topo" viewBox="0 0 ${W} ${H}" role="img" aria-label="Replica topology">${links}${packets}${labels}${nodes}</svg>`;
+  }
+
+  function dbTable(view) {
+    const rows = view.flatMap((v) => v.dbs.map((d) => ({ v, d })))
+      .sort((a, b) => (b.v.primary - a.v.primary) || a.v.r.ReplicaServerName.localeCompare(b.v.r.ReplicaServerName));
+    if (!rows.length) return '';
+    const tone = (d) => d.IsSuspended ? 'critical'
+      : d.SynchronizationHealth ? (d.SynchronizationHealth === 'HEALTHY' ? 'healthy' : 'warning')
+      : (['SYNCHRONIZED', 'SYNCHRONIZING'].includes(d.SynchronizationState) ? 'healthy' : 'warning');
+    return `<div style="overflow-x:auto"><table class="dbs"><thead><tr><th>Replica</th><th>Database</th><th>State</th>
+        <th class="r">Log queued</th><th class="r">Redo queued</th><th class="r">RPO</th><th class="r">RTO</th></tr></thead><tbody>
+      ${rows.map(({ v, d }) => `<tr><td>${esc(v.r.ReplicaServerName)}${v.primary ? ' <span class="tag">primary</span>' : ''}</td><td>${esc(d.DatabaseName)}</td>
+        <td><span class="st"><span class="dot ${tone(d)}"></span>${esc(d.IsSuspended ? 'suspended' + (d.SuspendReason ? ' (' + words(d.SuspendReason) + ')' : '') : words(d.SynchronizationState))}</span></td>
+        <td class="r"><span class="num">${v.primary ? '–' : kb(d.LogSendQueueKb)}</span></td><td class="r"><span class="num">${v.primary ? '–' : kb(d.RedoQueueKb)}</span></td>
+        <td class="r"><span class="num">${v.primary ? '–' : dur(d.EstimatedDataLossSec)}</span></td><td class="r"><span class="num">${v.primary ? '–' : dur(d.EstimatedRecoverySec)}</span></td></tr>`).join('')}
+      </tbody></table></div>`;
+  }
+
+  function sparkline(points, key, cls) {
+    if (points.length < 2) return '<svg viewBox="0 0 300 44"></svg>';
+    const vals = points.map((p) => p[key] ?? 0), max = Math.max(1, ...vals), w = 300, h = 44;
+    const xy = vals.map((v, i) => [(i / (vals.length - 1)) * w, h - 3 - (v / max) * (h - 8)]);
+    const line = xy.map((p, i) => (i ? 'L' : 'M') + p[0].toFixed(1) + ',' + p[1].toFixed(1)).join(' ');
+    return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><path class="area ${cls}" d="${line} L${w},${h} L0,${h} Z"/><path class="ln ${cls}" d="${line}"/></svg>`;
+  }
+
+  function side(ag, view) {
+    const crit = ag.alerts.filter((a) => a.Severity === 'Critical').length, warn = ag.alerts.length - crit;
+    const sec = view.filter((v) => !v.primary);
+    const rpo = Math.max(0, ...sec.map((v) => v.rpo)), rto = Math.max(0, ...sec.map((v) => v.rto));
+    const kpis = `<div class="kpis">
+      <div class="kpi ${crit ? 'crit' : 'ok'}"><div class="v">${crit}</div><div class="l">Critical alerts open</div></div>
+      <div class="kpi ${warn ? 'warn' : 'ok'}"><div class="v">${warn}</div><div class="l">Warnings open</div></div>
+      <div class="kpi ${rpo > 300 ? 'crit' : rpo > 60 ? 'warn' : 'ok'}"><div class="v">${dur(rpo)}</div><div class="l">Worst data loss if the primary failed now (RPO)</div></div>
+      <div class="kpi ${rto > 900 ? 'crit' : rto > 300 ? 'warn' : 'ok'}"><div class="v">${dur(rto)}</div><div class="l">Worst time to come online after failover (RTO)</div></div></div>`;
+    const sparks = sec.map((v) => {
+      const pts = ag.trend.filter((t) => t.ReplicaServerName === v.r.ReplicaServerName);
+      // One point per snapshot: the worst database of this replica
+      const by = new Map(); pts.forEach((p) => { const o = by.get(p.t) || { t: p.t, q: 0, rpo: 0 };
+        o.q = Math.max(o.q, p.LogSendQueueKb || 0); o.rpo = Math.max(o.rpo, p.EstimatedDataLossSec || 0); by.set(p.t, o); });
+      const series = [...by.values()];
+      return `<h3><span>${esc(v.r.ReplicaServerName)}: log queued</span><span class="num">${kb(v.sendKb)}</span></h3>${sparkline(series, 'q', '')}
+              <h3><span>${esc(v.r.ReplicaServerName)}: RPO</span><span class="num">${dur(v.rpo)}</span></h3>${sparkline(series, 'rpo', 'rpo')}`;
+    }).join('');
+    const strip = ag.strip.slice(-60).map((s) => `<i class="${esc(s.Status)}" title="${esc(hhmm(s.t))} ${esc(s.Status)}"></i>`).join('');
+    return `<section class="panel"><h2>Health right now</h2><p class="sub">Snapshot ${n0(ag.snapshot.SnapshotId)}, ${esc(ago(ag.snapshot.CollectedAt))}, ${n0(ag.snapshot.DurationMs)} ms</p>
+      ${kpis}<div class="spark">${sparks}<h3><span>Snapshots, last ${state.data.trendMinutes} min</span><span>${ag.strip.filter((s) => s.Status !== 'Succeeded').length} not clean</span></h3><div class="strip">${strip}</div></div></section>`;
+  }
+
+  // ---- incidents ------------------------------------------------------------------------
+  function incident(a) {
+    const path = [a.ReplicaServerName, a.DatabaseName, a.ObjectName].filter(Boolean).join(' / ');
+    const ev = (a.Evidence || []).map((e) => `<dt>${esc(e.Label)}</dt><dd>${e.Label === 'Statement' ? `<code>${esc(e.Value)}</code>` : esc(e.Value)}</dd>`).join('');
+    const plan = (a.Plan || []).length ? `<div class="plan"><h4>Recovery plan</h4><p class="note">Scripts are ready; nothing has been run. Production is never restored over.</p>
+      ${a.Plan.map((s) => `<div class="step"><div class="sh"><span class="stage ${esc(s.Stage)}">${s.Step} ${esc(s.Stage)}</span><span class="ttl">${esc(s.Title)}</span><span class="on">run on ${esc(s.RunOn)}</span></div>
+        ${s.Caution ? `<p class="caution">${esc(s.Caution)}</p>` : ''}
+        <div class="code"><pre>${esc(s.Sql)}</pre><button type="button" data-copy="${a.AlertId}:${s.Step}">Copy</button></div></div>`).join('')}</div>` : '';
+    const isNew = !state.first && !state.seen.has(a.AlertId) && a.Severity === 'Critical';
+    return `<article class="inc ${esc(a.Severity)} ${state.open.has(a.AlertId) ? 'open' : ''} ${isNew ? 'fresh' : ''}" data-id="${a.AlertId}">
+      <button class="head" type="button" aria-expanded="${state.open.has(a.AlertId)}">
+        <span class="sev">${esc(a.Severity)}</span>
+        <span><span class="t">${esc(a.Title)}</span><br><span class="p">${esc(path || a.AgName)}</span></span>
+        <span class="when">Open <b>${esc(dur((Date.now() - ms(a.FirstSeenAt)) / 1000))}</b>${a.ReminderCount ? `, reminded ${a.ReminderCount}×` : ''}<br>Alert ${a.AlertId}</span>
+      </button>
+      <div class="body"><p class="msg">${esc(a.Message)}</p>${ev ? `<dl class="ev">${ev}</dl>` : ''}
+        ${a.Runbook ? `<div class="check"><b>What to check</b><br>${esc(a.Runbook)}</div>` : ''}${plan}</div></article>`;
+  }
+  function incidents(ag) {
+    const list = ag.alerts.slice().sort((x, y) => (x.Severity === y.Severity ? ms(x.FirstSeenAt) - ms(y.FirstSeenAt) : x.Severity === 'Critical' ? -1 : 1));
+    return `<section class="panel incidents"><h2>Open incidents</h2><p class="sub">Select one for its evidence, what to check, and the recovery plan.</p>
+      ${list.length ? list.map(incident).join('') : '<p class="empty"><b>Nothing open.</b> Every rule is within its threshold.</p>'}</section>`;
+  }
+
+  // ---- Object Guard timeline, drift, resolved --------------------------------------------
+  function timeline(ag) {
+    const g = ag.guard || {}, w = g.watched || {};
+    const glyph = { Dropped: '×', DataLoss: '↓', Created: '+', Altered: '~', Restored: '↺' };
+    const items = (g.events || []).slice(0, 14).map((e) => {
+      const obj = `${e.SchemaName}.${e.ObjectName}`;
+      const what = e.EventType === 'DataLoss' ? `${n0((e.RowsBefore || 0) - (e.RowsAfter || 0))} rows removed from ${esc(obj)}`
+                 : e.EventType === 'Dropped' ? `${esc(obj)} dropped` : e.EventType === 'Created' ? `${esc(obj)} created`
+                 : e.EventType === 'Restored' ? `${esc(obj)} created again` : `${esc(obj)} changed`;
+      const who = e.LoginName ? `${esc(e.LoginName)}${e.HostName ? ` from ${esc(e.HostName)}` : ''}${e.AppName ? `, ${esc(e.AppName)}` : ''}` : 'account not captured';
+      const dec = e.Decision ? `<span class="tag ${e.Decision === 'Recover' ? 'warn' : 'ok'}">${e.Decision === 'Recover' ? 'Recover approved' : 'Confirmed intended'} by ${esc(e.DecidedBy)}</span>` : '';
+      const flag = e.AlertId ? `<span class="tag crit">alert ${e.AlertId}</span>` : '<span class="tag">recorded</span>';
+      return `<li><span class="glyph ${esc(e.EventType)}">${glyph[e.EventType] || '•'}</span>
+        <div><div class="what">${what} ${flag}${dec}</div><div class="who">${who}, in ${esc(e.DatabaseName)}</div></div>
+        <span class="tm">${esc(hhmm(e.OccurredAt || e.DetectedAt))}</span></li>`;
+    }).join('');
+    return `<section class="panel"><h2>Object Guard: drops, deletes and schema changes</h2><p class="sub">${w.Objects ? `Watching ${n0(w.Objects)} objects (${n0(w.Tables)} tables) in ${n0(w.Databases)} database${w.Databases === 1 ? '' : 's'}.` : 'Takes its first inventory on the next run.'} Drops, schema changes and mass deletes, with who did them.</p>
+      ${items ? `<ol class="tl">${items}</ol>` : '<p class="empty"><b>No changes recorded.</b></p>'}</section>`;
+  }
+  function drift(ag) {
+    const f = ag.drift.findings || [], run = ag.drift.run;
+    const by = new Map(); f.forEach((x) => { if (!by.has(x.TargetReplica)) by.set(x.TargetReplica, []); by.get(x.TargetReplica).push(x); });
+    const kind = (t) => t === 'AgentJob' ? 'Agent job' : t;
+    // What each finding means for that replica, in words, and whether it still needs a person
+    const tag = (r) => {
+      if (r.Action === 'Applied') return '<span class="tag ok">copied from primary</span>';
+      if (r.Action === 'Failed')  return '<span class="tag crit">copy failed</span>';
+      return { Missing: '<span class="tag crit">missing here</span>',
+               ExtraOnTarget: '<span class="tag warn">only on this replica</span>',
+               Different: '<span class="tag warn">differs from primary</span>',
+               NotRoleAware: '<span class="tag warn">not role-aware</span>' }[r.DriftType] || `<span class="tag">${esc(r.DriftType)}</span>`;
+    };
+    const groups = [...by.entries()].map(([t, rows]) => {
+      const open = rows.filter((r) => r.Action !== 'Applied');
+      const miss = open.filter((r) => r.DriftType === 'Missing'), extra = open.filter((r) => r.DriftType === 'ExtraOnTarget');
+      const diff = open.filter((r) => r.DriftType === 'Different');
+      const lines = [];
+      if (miss.length)  lines.push(`${miss.length} missing here: applications that use ${miss.length === 1 ? 'it' : 'them'} break if ${esc(t)} becomes PRIMARY.`);
+      if (extra.length) lines.push(`${extra.length} only on this replica, never on the primary: created here directly. Confirm who owns ${extra.length === 1 ? 'it' : 'them'}; AG Sync never copies or removes ${extra.length === 1 ? 'it' : 'them'}.`);
+      if (diff.length)  lines.push(`${diff.length} different from the primary (SID, password, roles or settings).`);
+      return `<div class="drift-group"><h3>${esc(t)}</h3>${lines.map((l) => `<p class="note">${l}</p>`).join('')}
+        <table class="dr">${rows.map((r) => `<tr><td>${esc(kind(r.ObjectType))}</td><td class="nm">${esc(r.ObjectName)}${r.Detail && r.DriftType === 'Different' ? `<div class="note" style="margin:2px 0 0;font-family:var(--body)">${esc(r.Detail)}</div>` : ''}</td><td>${tag(r)}</td></tr>`).join('')}</table></div>`;
+    }).join('');
+    const sub = run ? `Logins, Agent jobs and databases compared with the primary ${esc(ago(run.StartedAt))}, in both directions: missing on a secondary, and only on a secondary.` : 'No drift check has run for this AG yet.';
+    return `<section class="panel"><h2>Failover readiness: logins and jobs on each secondary</h2><p class="sub">${sub}</p>
+      ${!run ? '' : groups || '<p class="empty"><b>No drift.</b> Every login and job on the primary exists on every secondary, and no secondary has any of its own.</p>'}</section>`;
+  }
+  function resolved(ag) {
+    if (!ag.resolved.length) return '';
+    return `<section class="panel" style="margin-top:16px"><h2>Resolved in the last 24 hours</h2><p class="sub">How each one closed: measured, or decided by a person.</p>
+      <ol class="tl res">${ag.resolved.slice(0, 10).map((a) => `<li><div><div class="what">${esc(a.Title)} <span class="tag">${esc([a.DatabaseName, a.ObjectName].filter(Boolean).join(' / ') || a.ReplicaServerName || a.AgName)}</span></div>
+        <div class="who">${esc((a.ResolutionNote || (a.ResolvedBy && a.ResolvedBy !== 'measured' ? 'Closed by ' + a.ResolvedBy : 'Measured healthy again')).replace(/\.$/, ''))}.${a.ResolvedAt && a.FirstSeenAt ? ` Was ${esc((a.Severity || '').toLowerCase())} for ${esc(dur((ms(a.ResolvedAt) - ms(a.FirstSeenAt)) / 1000))}.` : ''}</div></div>
+        <span class="tm">${esc(hhmm(a.ResolvedAt))}</span></li>`).join('')}</ol></section>`;
+  }
+
+  // ---- page -------------------------------------------------------------------------------
+  function render() {
+    const d = state.data;
+    if (!d || !d.ags || !d.ags.length) { onboarding(d ? 'The data file has no AGs yet: the monitor has not stored a snapshot.' : null); return; }
+    const vis = d.ags.filter((a) => !state.hidden.has(a.name) && a.visible);
+    if (!vis.some((a) => a.name === state.ag)) state.ag = (vis[0] || d.ags[0]).name;
+    renderHeader(d);
+    const ag = d.ags.find((a) => a.name === state.ag);
+    const view = replicaView(ag), v = verdict(ag, view);
+    const age = (Date.now() - ms(d.generatedAt)) / 60000;
+    const stale = !(age < STALE_MIN) ? `<div class="banner">This data is ${esc(dur(age * 60))} old. Check that the scheduled task "AG Health Monitor" is running.</div>` : '';
+    const scrollY = window.scrollY;
+    const dbCount = new Set(ag.databases.map((x) => x.DatabaseName)).size;
+    const crit = ag.alerts.filter((a) => a.Severity === 'Critical').length;
+    document.title = `${crit ? `(${crit}) ` : ''}${ag.displayName}: Always On availability group | ${d.brand?.product || 'Always On Command Center'}`;
+    $('#main').innerHTML = `${stale}${renderFleet(d)}
+      <div class="agtitle"><h1>${esc(ag.displayName)} <span class="kind">Always On availability group</span>${ag.environment ? `<span class="tag">${esc(ag.environment)}</span>` : ''}</h1>
+        <p class="facts">${view.length} replicas, ${dbCount} ${dbCount === 1 ? 'database' : 'databases'}, primary ${esc(ag.snapshot.PrimaryReplica || 'none')}. ${ag.alerts.length ? `${ag.alerts.length} open ${ag.alerts.length === 1 ? 'incident' : 'incidents'}.` : 'No open incidents.'}</p></div>
+      <div class="verdict ${v.tone}"><h2>${v.h}</h2><p>${v.p}</p></div>
+      <div class="grid"><section class="panel"><h2>Replica topology and log flow</h2><p class="sub">Log flows from the primary, ${esc(ag.snapshot.PrimaryReplica || 'none')}, to each secondary. The dots move faster when more log is moving, and stop when it stops.</p>${topology(view)}${dbTable(view)}</section>${side(ag, view)}</div>
+      ${incidents(ag)}
+      <div class="grid-2">${timeline(ag)}${drift(ag)}</div>
+      ${resolved(ag)}`;
+    window.scrollTo(0, scrollY);
+    ag.alerts.forEach((a) => state.seen.add(a.AlertId));
+    state.first = false;
+  }
+  function onboarding(reason) {
+    $('#main').innerHTML = `<div class="onboard"><h1>Waiting for the monitor</h1>
+      <p>${esc(reason || 'This page reads data.js from its own folder, and that file is not there yet.')}</p>
+      <p>If you opened the copy in the repo, open the live one instead: the monitor keeps it, with its data, in
+      <code>%LOCALAPPDATA%\AlwaysOnCommandCenter\dashboard\index.html</code>.</p>
+      <p>The scheduled monitor writes it every minute. To write it now, run:</p>
+      <pre>Import-Module C:\\Labs\\AgSync\\AgHealth\\AgHealth.psm1
+Export-AgDashboardData -ControlInstance 'localhost,14340' -ControlCredential (Get-AgHealthSecret AgControl)</pre>
+      <p>This page checks again every 15 seconds.</p></div>`;
+  }
+
+  // ---- data: re-read data.js every 15 seconds (a script tag works from a file, fetch does not) ----
+  function load() {
+    const s = document.createElement('script');
+    s.src = 'data.js?t=' + Date.now();
+    s.onload = () => {
+      s.remove();
+      const d = window.AOCC_DATA;
+      if (!d) return;
+      // Same file as last time: keep the page (and its animation) as it is
+      if (state.data && d.generatedAt === state.data.generatedAt) return;
+      state.data = d; render();
+    };
+    s.onerror = () => { s.remove(); if (!state.data) onboarding(null); else render(); };
+    document.head.appendChild(s);
+  }
+
+  // ---- interaction --------------------------------------------------------------------------
+  function selectAg(name) { state.ag = name; store.set('ag', name); state.first = true; render(); }
+  document.addEventListener('click', (e) => {
+    const t = e.target.closest('[data-hide],[data-show],[data-ag],[data-copy],.inc > button.head');
+    if (!t) return;
+    if (t.dataset.hide) { e.stopPropagation(); state.hidden.add(t.dataset.hide); store.set('hidden', [...state.hidden]); render(); return; }
+    if (t.dataset.show) { state.hidden.delete(t.dataset.show); store.set('hidden', [...state.hidden]); render(); return; }
+    if (t.dataset.ag) { selectAg(t.dataset.ag); return; }
+    if (t.dataset.copy) {
+      const [id, step] = t.dataset.copy.split(':').map(Number);
+      const ag = state.data.ags.find((a) => a.name === state.ag);
+      const sql = ag.alerts.find((a) => a.AlertId === id)?.Plan.find((p) => p.Step === step)?.Sql || '';
+      const done = () => { t.textContent = 'Copied'; t.classList.add('done'); setTimeout(() => { t.textContent = 'Copy'; t.classList.remove('done'); }, 1600); };
+      const fallback = () => { const ta = document.createElement('textarea'); ta.value = sql; document.body.appendChild(ta); ta.select();
+        try { document.execCommand('copy'); done(); } catch { /* nothing to do */ } ta.remove(); };
+      if (navigator.clipboard?.writeText) navigator.clipboard.writeText(sql).then(done, fallback); else fallback();
+      return;
+    }
+    const inc = t.closest('.inc'); const id = Number(inc.dataset.id);
+    if (state.open.has(id)) state.open.delete(id); else state.open.add(id);
+    inc.classList.toggle('open'); t.setAttribute('aria-expanded', state.open.has(id));
+  });
+  document.addEventListener('keydown', (e) => {
+    const c = e.target.closest?.('.fleet .card');
+    if (c && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); selectAg(c.dataset.ag); }
+  });
+
+  load();
+  setInterval(load, REFRESH_MS);
+  setInterval(() => { if (state.data) $('#livetext').textContent = `Updated ${ago(state.data.generatedAt)}`; }, 1000);
+})();
+</script>
+</body>
+</html>

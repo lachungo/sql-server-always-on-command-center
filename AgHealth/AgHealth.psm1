@@ -35,6 +35,7 @@
     Public functions
       Invoke-AgHealthCollection - take one snapshot and store it
       Invoke-AgGuardCollection  - Object Guard pass on the primary of that snapshot
+      Export-AgDashboardData    - write the live dashboard's data file (dashboard/index.html reads it)
       Send-AgHealthNotification - announce new, escalated and resolved alerts on every channel
       New-AgHealthSlackChannel, New-AgHealthEmailChannel, New-AgHealthTestChannel - channel definitions
       Save-AgHealthSecret, Get-AgHealthSecret - per-user encrypted secrets (Windows)
@@ -236,6 +237,88 @@ WHERE c.object_id = OBJECT_ID(@obj)
 ORDER BY c.column_id;
 SELECT CONVERT(nvarchar(260), SERVERPROPERTY('InstanceDefaultBackupPath')) AS BackupPath,
        DATEDIFF(MINUTE, SYSUTCDATETIME(), SYSDATETIME()) AS UtcOffsetMinutes;
+"@
+
+# Dashboard export, on the controller: everything the live dashboard shows, for every AG, in one round trip
+$script:DashboardQuery = @"
+SET NOCOUNT ON;
+DECLARE @since datetime2(3) = DATEADD(MINUTE, -@trend, SYSUTCDATETIME());
+CREATE TABLE #latest (AgName sysname PRIMARY KEY, SnapshotId bigint);
+INSERT #latest
+SELECT AgName, MAX(SnapshotId) FROM aghealth.Snapshot
+WHERE Status <> 'Running' AND CollectedAt >= DATEADD(DAY, -7, SYSUTCDATETIME())
+GROUP BY AgName;
+
+-- 0 every AG and its latest snapshot
+SELECT s.AgName, s.SnapshotId, s.PrimaryReplica, s.CollectedAt, s.Status, s.DurationMs, s.ErrorMessage,
+       d.DisplayName, d.Environment,
+       CONVERT(bit, ISNULL(d.IsVisible, 1)) AS IsVisible, ISNULL(d.SortOrder, 100) AS SortOrder
+FROM #latest l JOIN aghealth.Snapshot s ON s.SnapshotId = l.SnapshotId
+LEFT JOIN aghealth.AgDisplay d ON d.AgName = s.AgName;
+-- 1 replicas
+SELECT l.AgName, r.ReplicaServerName, r.Role, r.AvailabilityMode, r.FailoverMode, r.ConnectedState,
+       r.OperationalState, r.SynchronizationHealth, r.IsReachable, r.LastConnectErrorText
+FROM #latest l JOIN aghealth.ReplicaState r ON r.SnapshotId = l.SnapshotId;
+-- 2 databases
+SELECT l.AgName, d.ReplicaServerName, d.DatabaseName, d.IsPrimaryReplica, d.SynchronizationState, d.SynchronizationHealth,
+       d.IsSuspended, d.SuspendReason, d.LogSendQueueKb, d.LogSendRateKbSec, d.RedoQueueKb, d.RedoRateKbSec,
+       d.EstimatedDataLossSec, d.EstimatedRecoverySec, d.LastCommitTime
+FROM #latest l JOIN aghealth.DatabaseState d ON d.SnapshotId = l.SnapshotId;
+-- 3 trends of the secondaries
+SELECT s.AgName, s.CollectedAt AS t, d.ReplicaServerName, d.DatabaseName, d.LogSendQueueKb, d.RedoQueueKb,
+       d.EstimatedDataLossSec, d.EstimatedRecoverySec
+FROM aghealth.Snapshot s JOIN aghealth.DatabaseState d ON d.SnapshotId = s.SnapshotId
+WHERE s.CollectedAt >= @since AND d.IsPrimaryReplica = 0
+ORDER BY s.SnapshotId;
+-- 4 snapshot strip
+SELECT AgName, CollectedAt AS t, Status FROM aghealth.Snapshot WHERE CollectedAt >= @since ORDER BY SnapshotId;
+-- 5 open alerts
+SELECT a.AlertId, a.AgName, r.RuleName, a.Severity, a.ReplicaServerName, a.DatabaseName, a.ObjectName, a.FirstSeenAt,
+       a.LastSeenAt, a.LastValue, a.Message, r.Runbook, r.Metric, r.Operator, r.ExpectedValue, r.WarnThreshold,
+       r.CritThreshold, a.ReminderCount, a.NotifiedAt
+FROM aghealth.Alert a JOIN aghealth.AlertRule r ON r.RuleId = a.RuleId
+WHERE a.State = 'Open';
+-- 6 their evidence
+SELECT e.AlertId, e.SortOrder, e.Label, e.Value
+FROM aghealth.AlertEvidence e JOIN aghealth.Alert a ON a.AlertId = e.AlertId
+WHERE a.State = 'Open' ORDER BY e.AlertId, e.SortOrder;
+-- 7 their scripts
+SELECT s.AlertId, s.Step, s.Stage, s.Title, s.RunOn, s.Caution, s.Sql
+FROM aghealth.AlertScript s JOIN aghealth.Alert a ON a.AlertId = s.AlertId
+WHERE a.State = 'Open' ORDER BY s.AlertId, s.Step;
+-- 8 resolved in the last 24 hours
+SELECT TOP (25) a.AlertId, a.AgName, r.RuleName, a.Severity, a.ReplicaServerName, a.DatabaseName, a.ObjectName,
+       a.FirstSeenAt, a.ResolvedAt, a.ResolvedBy, a.ResolutionNote
+FROM aghealth.Alert a JOIN aghealth.AlertRule r ON r.RuleId = a.RuleId
+WHERE a.State = 'Resolved' AND a.ResolvedAt >= DATEADD(DAY, -1, SYSUTCDATETIME())
+ORDER BY a.ResolvedAt DESC;
+-- 9 Object Guard timeline
+IF OBJECT_ID('aghealth.ObjectEvent') IS NOT NULL
+    SELECT TOP (60) o.ObjectEventId, o.AgName, o.EventType, o.DatabaseName, o.SchemaName, o.ObjectName, o.ObjectType,
+           o.DetectedAt, o.OccurredAt, o.LoginName, o.HostName, o.AppName, o.RowsBefore, o.RowsAfter, o.IsApproved,
+           o.AlertId, dd.Decision, dd.DecidedBy, dd.ConfirmedWith
+    FROM aghealth.ObjectEvent o
+    OUTER APPLY (SELECT TOP (1) d.Decision, d.DecidedBy, d.ConfirmedWith FROM aghealth.AlertDecision d
+                 WHERE d.AlertId = o.AlertId ORDER BY d.DecisionId DESC) dd
+    ORDER BY o.ObjectEventId DESC;
+ELSE
+    SELECT CAST(NULL AS bigint) AS ObjectEventId, CAST(NULL AS sysname) AS AgName WHERE 1 = 0;
+-- 10 replica drift: the latest successful AG Sync run of each AG
+IF OBJECT_ID('agsync.SyncRun') IS NOT NULL
+    SELECT r.AgName, r.RunId, r.Mode, r.StartedAt, f.ObjectType, f.ObjectName, f.SourceReplica, f.TargetReplica,
+           f.DriftType, f.Detail, f.Action
+    FROM (SELECT AgName, MAX(RunId) AS RunId FROM agsync.SyncRun WHERE Status = 'Succeeded' GROUP BY AgName) l
+    JOIN agsync.SyncRun r ON r.RunId = l.RunId
+    LEFT JOIN agsync.DriftFinding f ON f.RunId = r.RunId;
+ELSE
+    SELECT CAST(NULL AS sysname) AS AgName WHERE 1 = 0;
+-- 11 how many objects Object Guard watches
+IF OBJECT_ID('aghealth.ObjectInventory') IS NOT NULL
+    SELECT AgName, COUNT(*) AS Objects, COUNT(DISTINCT DatabaseName) AS Databases,
+           SUM(CASE WHEN ObjectType = 'USER_TABLE' THEN 1 ELSE 0 END) AS Tables
+    FROM aghealth.ObjectInventory WHERE IsPresent = 1 GROUP BY AgName;
+ELSE
+    SELECT CAST(NULL AS sysname) AS AgName WHERE 1 = 0;
 "@
 
 #endregion
@@ -890,6 +973,124 @@ WHERE a.State = 'Open' AND a.AgName = @ag AND r.RuleName IN ('ObjectDropped', 'M
     }
 }
 
+function ConvertTo-AgDashboardRow {
+    # DataRows as plain objects for JSON: DBNull -> null, dates -> ISO 8601 UTC, decimals -> numbers
+    param($Table)
+    if (-not $Table) { return @() }
+    $names = @($Table.Columns | ForEach-Object ColumnName)
+    @(foreach ($row in $Table.Rows) {
+        $o = [ordered]@{}
+        foreach ($n in $names) {
+            $v = $row[$n]
+            $o[$n] = if ($v -is [DBNull]) { $null }
+                     elseif ($v -is [datetime]) { $v.ToString('yyyy-MM-ddTHH:mm:ss.fff') + 'Z' }
+                     elseif ($v -is [decimal]) { [double]$v }
+                     elseif ($v -is [guid]) { $v.ToString() }
+                     else { $v }
+        }
+        [pscustomobject]$o
+    })
+}
+
+function Export-AgDashboardData {
+    <#
+    .SYNOPSIS
+        Writes the live dashboard's data file for every AG in the control database.
+    .DESCRIPTION
+        The dashboard (dashboard/index.html) is one page that reads data.js from its own folder and refreshes
+        it every 15 seconds: no web server, no open port, nothing to install. The page is copied next to the
+        data the first time, and again whenever the repo has a newer one.
+        The file holds state only, never secrets: topology, queues, RPO/RTO and their trends, open alerts with
+        evidence and recovery plans, recent resolutions, Object Guard events and replica drift.
+    .EXAMPLE
+        Export-AgDashboardData -ControlInstance localhost,14340 -ControlCredential $ctl -Brand $brand
+        Start-Process "$env:LOCALAPPDATA\AlwaysOnCommandCenter\dashboard\index.html"
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $ControlInstance,
+        [string] $ControlDatabase = 'AgSyncControl',
+        [pscredential] $ControlCredential,
+        [string] $OutputDirectory = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'AlwaysOnCommandCenter\dashboard'),
+        [object] $Brand = (Get-AgHealthDefaultBrand),
+        [ValidateRange(10, 1440)] [int] $TrendMinutes = 60
+    )
+    $control = @{ SqlInstance = $ControlInstance; Database = $ControlDatabase }
+    if ($ControlCredential) { $control.SqlCredential = $ControlCredential }
+    if (-not $Brand) { $Brand = Get-AgHealthDefaultBrand }
+    $ds = Invoke-DbaQuery @control -EnableException -As DataSet -Query $script:DashboardQuery -SqlParameter @{ trend = $TrendMinutes }
+    # One slot per result set, by position. Assigned one by one, so an empty result set stays an empty
+    # slot instead of disappearing (which would shift every later section into the wrong place).
+    $t = [object[]]::new([Math]::Max(12, $ds.Tables.Count))
+    for ($i = 0; $i -lt $t.Count; $i++) {
+        $t[$i] = if ($i -lt $ds.Tables.Count) { @(ConvertTo-AgDashboardRow $ds.Tables[$i]) } else { @() }
+    }
+    $pick = { param([int] $i, [string] $ag) @($t[$i] | Where-Object { $_.AgName -eq $ag }) }
+
+    $evidence = @{}; foreach ($e in $t[6]) { $k = [string]$e.AlertId; if (-not $evidence[$k]) { $evidence[$k] = [Collections.Generic.List[object]]::new() }; $evidence[$k].Add($e) }
+    $scripts  = @{}; foreach ($e in $t[7]) { $k = [string]$e.AlertId; if (-not $scripts[$k])  { $scripts[$k]  = [Collections.Generic.List[object]]::new() }; $scripts[$k].Add($e) }
+
+    $ags = foreach ($a in $t[0] | Sort-Object SortOrder, AgName) {
+        $name   = $a.AgName
+        $alerts = @(& $pick 5 $name | ForEach-Object {
+            $k = [string]$_.AlertId
+            $_ | Add-Member -NotePropertyName Title -NotePropertyValue (Get-AgHealthTitle $_.RuleName) -PassThru |
+                 Add-Member -NotePropertyName Evidence -NotePropertyValue @($(if ($evidence[$k]) { $evidence[$k].ToArray() })) -PassThru |
+                 Add-Member -NotePropertyName Plan -NotePropertyValue @($(if ($scripts[$k]) { $scripts[$k].ToArray() })) -PassThru
+        })
+        $drift = @(& $pick 10 $name)
+        [pscustomobject]@{
+            name        = $name
+            displayName = if ($a.DisplayName) { $a.DisplayName } else { $name }
+            environment = $a.Environment
+            visible     = [bool]$a.IsVisible
+            snapshot    = $a
+            replicas    = @(& $pick 1 $name)
+            databases   = @(& $pick 2 $name)
+            trend       = @(& $pick 3 $name)
+            strip       = @(& $pick 4 $name)
+            alerts      = $alerts
+            resolved    = @(& $pick 8 $name | ForEach-Object { $_ | Add-Member -NotePropertyName Title -NotePropertyValue (Get-AgHealthTitle $_.RuleName) -PassThru })
+            guard       = [pscustomobject]@{ events = @(& $pick 9 $name); watched = @(& $pick 11 $name) | Select-Object -First 1 }
+            drift       = [pscustomobject]@{
+                run      = $drift | Select-Object -First 1 RunId, Mode, StartedAt
+                findings = @($drift | Where-Object { $_.ObjectName } | Select-Object ObjectType, ObjectName, SourceReplica, TargetReplica, DriftType, Detail, Action)
+            }
+        }
+    }
+
+    $null = New-Item -ItemType Directory -Path $OutputDirectory -Force
+    $logo = $null
+    if ($Brand.LogoPath -and (Test-Path $Brand.LogoPath)) {
+        $logo = 'logo' + [IO.Path]::GetExtension($Brand.LogoPath)
+        Copy-Item -Path $Brand.LogoPath -Destination (Join-Path $OutputDirectory $logo) -Force
+    }
+    $doc = [ordered]@{
+        version     = 1
+        generatedAt = [datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fff') + 'Z'
+        source      = $Brand.SourceName
+        brand       = [ordered]@{ name = $Brand.Name; product = $Brand.Product; tagline = $Brand.Tagline
+                                  url = $Brand.Url; contact = $Brand.Contact; accent = $Brand.AccentColor; logo = $logo }
+        trendMinutes = $TrendMinutes
+        ags         = @($ags)
+    }
+    $json = ConvertTo-Json -InputObject $doc -Depth 12 -Compress
+    # Written to a temp file, then swapped in, so the page never reads half a file
+    $final = Join-Path $OutputDirectory 'data.js'
+    $temp  = Join-Path $OutputDirectory 'data.js.tmp'
+    [IO.File]::WriteAllText($temp, "window.AOCC_DATA = $json;", [Text.UTF8Encoding]::new($false))
+    Move-Item -Path $temp -Destination $final -Force
+
+    # The page itself, from the repo, when it is newer than the copy next to the data
+    $page = Join-Path $PSScriptRoot '../dashboard/index.html'
+    $dest = Join-Path $OutputDirectory 'index.html'
+    if ((Test-Path $page) -and (-not (Test-Path $dest) -or (Get-Item $page).LastWriteTimeUtc -gt (Get-Item $dest).LastWriteTimeUtc)) {
+        Copy-Item -Path $page -Destination $dest -Force
+    }
+    [pscustomobject]@{ PSTypeName = 'AgHealth.Dashboard'; Path = $dest; Data = $final; Ags = @($ags).Count
+                       Bytes = (Get-Item $final).Length }
+}
+
 #endregion
 
 #region Notifications ---------------------------------------------------------
@@ -1529,6 +1730,6 @@ function Get-AgHealthSecret {
 
 #endregion
 
-Export-ModuleMember -Function Invoke-AgHealthCollection, Invoke-AgGuardCollection, Send-AgHealthNotification, New-AgHealthBrand,
+Export-ModuleMember -Function Invoke-AgHealthCollection, Invoke-AgGuardCollection, Send-AgHealthNotification, Export-AgDashboardData, New-AgHealthBrand,
                               New-AgHealthSlackChannel, New-AgHealthEmailChannel, New-AgHealthTestChannel,
                               Save-AgHealthSecret, Get-AgHealthSecret

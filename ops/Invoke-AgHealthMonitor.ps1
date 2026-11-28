@@ -11,6 +11,8 @@
     - Never silent: every run writes to a daily log, and a failure sets a non-zero exit code.
     - Secrets never live in the config file: it only names secrets saved with Save-AgHealthSecret.
     - Object Guard runs after every successful snapshot; set "Guard": false in the config to turn it off.
+    - Replica drift (AG Sync, detect only) every 15 minutes ("DriftEveryMinutes"; 0 turns it off).
+    - The live dashboard's data file is written after every run ("Dashboard": false turns it off).
     - Daily upkeep: snapshot retention (aghealth.usp_PurgeHistory) once a day, and old logs removed.
 
     Exit codes: 0 ok or skipped, 1 collection failed, 2 a notification channel failed, 3 configuration error.
@@ -76,11 +78,11 @@ try {
     $control = @{ SqlInstance = $cfg.ControlInstance; Database = $controlDb }
     if ($ctl) { $control.SqlCredential = $ctl }
 
-    # Channels from the config, unless given directly
+    # Branding (notifications and dashboard) and channels from the config, unless channels are given directly
+    $brandArgs = @{}
+    if ($cfg.Brand) { foreach ($p in $cfg.Brand.PSObject.Properties) { if ($p.Value) { $brandArgs[$p.Name] = $p.Value } } }
+    $brand = New-AgHealthBrand @brandArgs
     if (-not $PSBoundParameters.ContainsKey('Channel')) {
-        $brandArgs = @{}
-        if ($cfg.Brand) { foreach ($p in $cfg.Brand.PSObject.Properties) { if ($p.Value) { $brandArgs[$p.Name] = $p.Value } } }
-        $brand   = New-AgHealthBrand @brandArgs
         $Channel = @()
         if ($cfg.Slack) {
             $Channel += New-AgHealthSlackChannel -WebhookCredential (Get-AgHealthSecret $cfg.Slack.Secret) -Brand $brand
@@ -154,6 +156,40 @@ try {
             Write-MonitorLog ERROR "$($cfg.AgName): notification failed: $($_.Exception.Message)"
             if ($exitCode -eq 0) { $exitCode = 2 }
         }
+    }
+
+    # ---- Replica drift (AG Sync, detect only), every DriftEveryMinutes (default 15; 0 = off) -------
+    $driftEvery = if ($null -ne $cfg.DriftEveryMinutes) { [int]$cfg.DriftEveryMinutes } else { 15 }
+    $driftMark  = Join-Path $LogDirectory "$agTag.lastdrift"
+    $lastDrift  = if (Test-Path $driftMark) { [datetime]::Parse((Get-Content $driftMark -Raw).Trim(), [Globalization.CultureInfo]::InvariantCulture, 'AdjustToUniversal') } else { [datetime]::MinValue }
+    if ($driftEvery -gt 0 -and $det -and $s -and $s.Status -eq 'Succeeded' -and ([datetime]::UtcNow - $lastDrift).TotalMinutes -ge $driftEvery) {
+        try {
+            # AG Sync lives at the repo root or in an AgSync folder, depending on the checkout
+            $syncModule = @('../AgSync.psm1', '../AgSync/AgSync.psm1') | ForEach-Object { Join-Path $PSScriptRoot $_ } |
+                          Where-Object { Test-Path $_ } | Select-Object -First 1
+            if (-not $syncModule) { throw "AgSync.psm1 not found next to the ops folder (looked in the repo root and in AgSync\)." }
+            Import-Module $syncModule -Force
+            $sync = @{ Replica = @($cfg.Replica); AgName = $cfg.AgName; SqlCredential = $det; Mode = 'Detect'
+                       ControlInstance = $cfg.ControlInstance; ControlDatabase = $controlDb }
+            if ($ctl) { $sync.ControlCredential = $ctl }
+            $found = @(Invoke-AgSync @sync -WarningAction SilentlyContinue)
+            Set-Content -Path $driftMark -Value ([datetime]::UtcNow.ToString('o'))
+            $missing = @($found | Where-Object DriftType -eq 'Missing').Count
+            Write-MonitorLog INFO ("{0}: drift check {1} finding(s), {2} missing on a secondary." -f $cfg.AgName, $found.Count, $missing)
+        }
+        catch { Write-MonitorLog WARN "$($cfg.AgName): drift check failed: $($_.Exception.Message)" }
+    }
+
+    # ---- Live dashboard data (every run; a failure never fails the run) --------------------------
+    if ($cfg.Dashboard -ne $false) {
+        try {
+            $dashArgs = @{ ControlInstance = $cfg.ControlInstance; ControlDatabase = $controlDb }
+            if ($ctl) { $dashArgs.ControlCredential = $ctl }
+            if ($brand) { $dashArgs.Brand = $brand }
+            $d = Export-AgDashboardData @dashArgs
+            Write-Verbose "Dashboard: $($d.Ags) AG(s), $($d.Bytes) bytes, $($d.Path)"
+        }
+        catch { Write-MonitorLog WARN "$($cfg.AgName): dashboard export failed: $($_.Exception.Message)" }
     }
 
     # ---- Daily upkeep ----------------------------------------------------------------------------
