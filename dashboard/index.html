@@ -257,7 +257,8 @@
   function readiness(ag, v) {
     const f = (ag.drift.findings || []).filter((x) => x.TargetReplica === v.r.ReplicaServerName && x.Action !== 'Applied');
     const missing = f.filter((x) => x.DriftType === 'Missing' || x.DriftType === 'Different');
-    const extra = f.filter((x) => x.DriftType === 'ExtraOnTarget');
+    const extra = f.filter((x) => x.DriftType === 'ExtraOnTarget' && !(ag.drift.exceptions || []).some((e) => !e.OnHold
+                    && e.ReplicaServerName === x.TargetReplica && e.ObjectName === x.ObjectName && e.ObjectType === x.ObjectType));
     const waiting = f.filter((x) => x.Action === 'NeedsApproval');
     const sync = v.r.AvailabilityMode === 'SYNCHRONOUS_COMMIT';
     const allSynced = v.dbs.length && v.dbs.every((d) => d.SynchronizationState === 'SYNCHRONIZED');
@@ -458,7 +459,12 @@
     const by = new Map(); f.forEach((x) => { if (!by.has(x.TargetReplica)) by.set(x.TargetReplica, []); by.get(x.TargetReplica).push(x); });
     const kind = (t) => t === 'AgentJob' ? 'Agent job' : t;
     // What each finding means for that replica, in words, and whether it still needs a person
+    const exc = (r) => (ag.drift.exceptions || []).find((e) => e.ReplicaServerName === r.TargetReplica && e.ObjectName === r.ObjectName
+                                                           && (e.ObjectType === r.ObjectType));
     const tag = (r) => {
+      const e = r.DriftType === 'ExtraOnTarget' ? exc(r) : null;
+      if (e && !e.OnHold) return `<span class="tag ok">approved exception, review by ${esc(String(e.ExpiresAt).slice(0, 10))}</span>`;
+      if (e && e.OnHold) return '<span class="tag warn">exception on hold: primary changed</span>';
       if (r.Action === 'Applied') return '<span class="tag ok">copied from primary</span>';
       if (r.Action === 'Failed')  return '<span class="tag crit">copy failed</span>';
       if (r.Action === 'NeedsApproval') return '<span class="tag warn">waiting for DBA approval</span>';
@@ -468,12 +474,14 @@
                NotRoleAware: '<span class="tag warn">not role-aware</span>' }[r.DriftType] || `<span class="tag">${esc(r.DriftType)}</span>`;
     };
     const groups = [...by.entries()].map(([t, rows]) => {
-      const open = rows.filter((r) => r.Action !== 'Applied');
+      const open = rows.filter((r) => r.Action !== 'Applied' && !(r.DriftType === 'ExtraOnTarget' && exc(r) && !exc(r).OnHold));
       const miss = open.filter((r) => r.DriftType === 'Missing'), extra = open.filter((r) => r.DriftType === 'ExtraOnTarget');
       const diff = open.filter((r) => r.DriftType === 'Different');
       const lines = [];
       if (miss.length)  lines.push(`${miss.length} missing here: applications that use ${miss.length === 1 ? 'it' : 'them'} break if ${esc(t)} becomes PRIMARY.`);
-      if (extra.length) lines.push(`${extra.length} only on this replica, never on the primary: created here directly. Confirm who owns ${extra.length === 1 ? 'it' : 'them'}; AG Sync never copies or removes ${extra.length === 1 ? 'it' : 'them'}.`);
+      if (extra.length) lines.push(`${extra.length} currently only on this replica, not on the primary. Confirm who owns ${extra.length === 1 ? 'it' : 'them'}, then keep ${extra.length === 1 ? 'it' : 'them'} as an approved exception or remove ${extra.length === 1 ? 'it' : 'them'}; AG Sync never copies or removes ${extra.length === 1 ? 'it' : 'them'}.`);
+      const waiting = open.filter((r) => r.Action === 'NeedsApproval');
+      if (waiting.length) lines.push(`${waiting.length} waiting for DBA approval. Approve one object at a time with agsync.usp_ApproveSync; the next run applies exactly what was approved.`);
       if (diff.length)  lines.push(`${diff.length} different from the primary (SID, password, roles or settings).`);
       return `<div class="drift-group"><h3>${esc(t)}</h3>${lines.map((l) => `<p class="note">${l}</p>`).join('')}
         <table class="dr">${rows.map((r) => `<tr><td>${esc(kind(r.ObjectType))}</td><td class="nm">${esc(r.ObjectName)}${r.Detail && r.DriftType === 'Different' ? `<div class="note" style="margin:2px 0 0;font-family:var(--body)">${esc(r.Detail)}</div>` : ''}</td><td>${tag(r)}</td></tr>`).join('')}</table></div>`;

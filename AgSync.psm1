@@ -437,36 +437,74 @@ function Get-AgSyncDatabasePlan {
 
 #region Run logging and execution ---------------------------------------------
 
-# Auto mode: what may be applied without a person, and what waits for one.
-# Anything that grants power, removes something, or rebuilds a login waits for DBA approval.
-$script:ElevatedRoles = @('sysadmin', 'securityadmin', 'serveradmin', 'setupadmin', 'processadmin', 'diskadmin',
-                          'dbcreator', 'bulkadmin', '##MS_LoginManager##', '##MS_DatabaseManager##',
-                          '##MS_ServerStateManager##', '##MS_ServerSecurityStateReader##')
-$script:ElevatedPermissions = @('CONTROL SERVER', 'ALTER ANY LOGIN', 'IMPERSONATE ANY LOGIN', 'ALTER ANY SERVER ROLE',
-                                'ALTER ANY CREDENTIAL', 'ALTER ANY ENDPOINT', 'ALTER ANY CONNECTION', 'ALTER SETTINGS',
-                                'ALTER SERVER STATE', 'SHUTDOWN', 'ALTER ANY DATABASE', 'CREATE ANY DATABASE',
-                                'AUTHENTICATE SERVER', 'EXTERNAL ACCESS ASSEMBLY', 'UNSAFE ASSEMBLY')
+# Auto mode: what may be applied without a person, and what waits for one. Deny by default:
+# a server role or permission that is not on these short lists of known-harmless ones waits for a DBA,
+# so a custom server role holding CONTROL SERVER is caught as well as sysadmin.
+$script:SafeServerRoles = @('public', '##MS_ServerStateReader##', '##MS_ServerPerformanceStateReader##',
+                            '##MS_DefinitionReader##', '##MS_PerformanceDefinitionReader##')
+$script:SafeServerPermissions = @('VIEW SERVER STATE', 'VIEW SERVER PERFORMANCE STATE', 'VIEW ANY DEFINITION',
+                                  'VIEW ANY PERFORMANCE DEFINITION', 'VIEW ANY DATABASE', 'VIEW ANY ERROR LOG')
 
 function Test-AgSyncAutoPolicy {
-    # $null = may be applied now; otherwise the reason it needs a DBA
+    # $null = may be applied without a person; otherwise the reason it waits for DBA approval
     param($Finding, $Plan)
     $f = $Finding; $s = $f.SourceObject
     switch ($f.ObjectType) {
         'Login' {
             if ($f.DriftType -eq 'Different' -and 'sid' -in $f.Property) { return 'SID differs: fixing it drops and recreates the login' }
             $roles = @("$($s.server_roles)" -split ',' | Where-Object { $_ })
-            $perms = @("$($s.server_permissions)" -split ',' | Where-Object { $_ } | ForEach-Object { $_ -replace '^(GRANT|DENY|GRANT_WITH_GRANT_OPTION) ', '' })
-            $hiRoles = @($roles | Where-Object { $_ -in $script:ElevatedRoles })
-            $hiPerms = @($perms | Where-Object { $_ -in $script:ElevatedPermissions })
-            if ($hiRoles.Count -or $hiPerms.Count) {
-                return "elevated login ($((@($hiRoles) + @($hiPerms)) -join ', '))"
+            $grants = @("$($s.server_permissions)" -split ',' | Where-Object { $_ -and $_ -notmatch '^DENY ' })
+            $badRoles = @($roles | Where-Object { $_ -notin $script:SafeServerRoles })
+            $badPerms = @($grants | Where-Object {
+                $_ -match '^GRANT_WITH_GRANT_OPTION ' -or ($_ -replace '^GRANT ', '') -notin $script:SafeServerPermissions })
+            if ($badRoles.Count -or $badPerms.Count) {
+                return "elevated login ($((@($badRoles) + @($badPerms | ForEach-Object { $_ -replace '^GRANT ', '' })) -join ', '))"
             }
-            return $null
+            return $null                                  # DENY permissions only restrict, and copy freely
         }
-        'AgentJob' { return $null }                       # role-aware jobs only: the others were already blocked
+        'AgentJob' { return 'Agent jobs run as their owner (often sa): copying one grants privileged execution' }
         'Database' { return 'adding a database to the AG starts seeding to every replica' }
         default    { return 'not covered by the automatic policy' }
     }
+}
+
+function Get-AgSyncFingerprint {
+    # SHA-256 of what a change would create, so an approval can only ever apply what was reviewed
+    param($Finding)
+    $s = $Finding.SourceObject
+    if (-not $s) { return $null }
+    $text = switch ($Finding.ObjectType) {
+        'Login'    { 'Login|{0}|{1}|{2}|{3}|{4}|{5}' -f $s.name, $s.type_desc, $s.sid, $s.server_roles, $s.server_permissions, $s.is_disabled }
+        'AgentJob' { 'AgentJob|{0}|{1}|{2}|{3}|{4}' -f $s.name, $s.step_hash, $s.schedule_hash, $s.owner_name, $s.enabled }
+        'Database' { 'Database|{0}|{1}' -f $s.name, $s.recovery_model_desc }
+        default    { $null }
+    }
+    if (-not $text) { return $null }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { '0x' + (($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($text)) | ForEach-Object { $_.ToString('X2') }) -join '') }
+    finally { $sha.Dispose() }
+}
+
+function Get-AgSyncApproval {
+    # The newest unused, unexpired approval for this object on this replica (or $null)
+    param($Ctx, $Finding)
+    $cs = $Ctx.Control
+    Invoke-DbaQuery @cs -EnableException -Query @"
+SELECT TOP (1) ApprovalId, Fingerprint, ApprovedBy, Reason
+FROM agsync.Approval
+WHERE AgName = @ag AND ObjectType = @type AND ObjectName = @name AND TargetReplica = @tgt
+  AND UsedAt IS NULL AND ExpiresAt > SYSUTCDATETIME()
+ORDER BY ApprovalId DESC;
+"@ -SqlParameter @{ ag = $Ctx.AgName; type = $Finding.ObjectType; name = $Finding.ObjectName; tgt = $Finding.TargetReplica }
+}
+
+function Complete-AgSyncApproval {
+    param($Ctx, [int] $ApprovalId, [int] $RunId, [string] $Outcome)
+    $cs = $Ctx.Control
+    Invoke-DbaQuery @cs -EnableException -Query @"
+UPDATE agsync.Approval SET UsedAt = SYSUTCDATETIME(), UsedRunId = @run, Outcome = @outcome
+WHERE ApprovalId = @id AND UsedAt IS NULL;
+"@ -SqlParameter @{ id = $ApprovalId; run = $RunId; outcome = $Outcome }
 }
 
 function Start-AgSyncRun {
@@ -479,15 +517,15 @@ INSERT agsync.SyncRun (AgName, PrimaryReplica, Mode) OUTPUT INSERTED.RunId VALUE
 
 function Write-AgSyncFinding {
     # Logs one decision. Planned SQL is never stored: it can contain password hashes.
-    param($Ctx, [int] $RunId, $Finding, [string] $Action, [string] $Note)
+    param($Ctx, [int] $RunId, $Finding, [string] $Action, [string] $Note, [string] $Fingerprint)
     $cs = $Ctx.Control
     Invoke-DbaQuery @cs -EnableException -Query @"
-INSERT agsync.DriftFinding (RunId, ObjectType, ObjectName, SourceReplica, TargetReplica, DriftType, Detail, Action, ActionAt)
+INSERT agsync.DriftFinding (RunId, ObjectType, ObjectName, SourceReplica, TargetReplica, DriftType, Detail, Action, ActionAt, Fingerprint)
 VALUES (@run, @type, @name, @src, @tgt, @drift, @detail, @action,
-        CASE WHEN @action IN ('Applied', 'Failed') THEN SYSUTCDATETIME() END);
+        CASE WHEN @action IN ('Applied', 'Failed') THEN SYSUTCDATETIME() END, NULLIF(@fp, ''));
 "@ -SqlParameter @{ run = $RunId; type = $Finding.ObjectType; name = $Finding.ObjectName
                     src = $Finding.SourceReplica; tgt = $Finding.TargetReplica; drift = $Finding.DriftType
-                    detail = $Note; action = $Action }
+                    detail = $Note; action = $Action; fp = "$Fingerprint" }
 }
 
 function Complete-AgSyncRun {
@@ -569,6 +607,11 @@ function Invoke-AgSync {
         [ValidateSet('Login', 'AgentJob', 'Database')] [string[]] $ObjectType = @('Login', 'AgentJob', 'Database'),
         # Detect: report only. Apply: apply every plan. Auto: apply what the policy allows, the rest waits for a DBA.
         [ValidateSet('Detect', 'Apply', 'Auto')] [string] $Mode = 'Detect',
+        # Scope: only these objects / only these target replicas (Apply and Auto)
+        [string[]] $Name,
+        [string[]] $TargetReplica,
+        # Apply mode holds back elevated logins unless they are named with -Name, or this switch is given
+        [switch] $IncludePrivileged,
         [string] $ControlInstance = 'localhost',
         [string] $ControlDatabase = 'AgSyncControl',
         [pscredential] $ControlCredential
@@ -592,6 +635,8 @@ function Invoke-AgSync {
 
         $blockedJobs = @($findings | Where-Object { $_.ObjectType -eq 'AgentJob' -and $_.DriftType -eq 'NotRoleAware' } |
                          ForEach-Object ObjectName)
+        if ($Name)          { $findings = @($findings | Where-Object { $_.ObjectName -in $Name }) }
+        if ($TargetReplica) { $findings = @($findings | Where-Object { $_.TargetReplica -in $TargetReplica -or $_.ObjectType -eq 'Database' }) }
 
         $results = foreach ($f in $findings) {
             $plan = switch ($f.ObjectType) {
@@ -600,12 +645,29 @@ function Invoke-AgSync {
                 'Database' { Get-AgSyncDatabasePlan $ctx $f }
             }
 
-            if ($Mode -eq 'Auto' -and $plan.Kind) {
+            $fp = Get-AgSyncFingerprint $f
+            $approval = $null
+            if ($Mode -in 'Apply', 'Auto' -and $plan.Kind) {
                 $why = Test-AgSyncAutoPolicy $f $plan
-                if ($why) {
-                    $plan.Kind   = $null
-                    $plan.Action = 'NeedsApproval'
-                    $plan.Note   = "$($plan.Note); needs DBA approval: $why".TrimStart('; ')
+                if ($why -and $Mode -eq 'Auto') {
+                    # Held back, unless a DBA approved exactly this definition for this replica
+                    $a = Get-AgSyncApproval $ctx $f
+                    if ($a -and $fp -and $a.Fingerprint -eq $fp) {
+                        $approval = $a
+                        $plan.Note = "$($plan.Note); approved by $($a.ApprovedBy) (approval $($a.ApprovalId)): $($a.Reason)".TrimStart('; ')
+                    }
+                    else {
+                        $plan.Kind = $null; $plan.Action = 'NeedsApproval'
+                        $plan.Note = "$($plan.Note); needs DBA approval: $why".TrimStart('; ')
+                        if ($a) { $plan.Note += "; approval $($a.ApprovalId) no longer matches: the definition changed after it was approved" }
+                    }
+                }
+                elseif ($why -and $Mode -eq 'Apply' -and $f.ObjectType -eq 'Login' -and $why -like 'elevated*' -and
+                        -not $IncludePrivileged -and $f.ObjectName -notin $Name) {
+                    # A bulk Apply (a person at the keyboard) still never sweeps an elevated login along with the
+                    # ordinary ones: it must be named, or approved. SID rebuilds, jobs and databases stay as before.
+                    $plan.Kind = $null; $plan.Action = 'NeedsApproval'
+                    $plan.Note = "$($plan.Note); held back by Apply: $why (approve it with agsync.usp_ApproveSync, or name it with -Name)".TrimStart('; ')
                 }
             }
 
@@ -617,9 +679,10 @@ function Invoke-AgSync {
                     $plan.Action = 'Failed'
                     $plan.Note  += "; error: $($_.Exception.Message)"
                 }
+                if ($approval) { Complete-AgSyncApproval $ctx ([int]$approval.ApprovalId) $runId $plan.Action }
             }
 
-            Write-AgSyncFinding $ctx $runId $f $plan.Action $plan.Note
+            Write-AgSyncFinding $ctx $runId $f $plan.Action $plan.Note $fp
 
             [pscustomobject]@{
                 PSTypeName    = 'AgSync.Result'

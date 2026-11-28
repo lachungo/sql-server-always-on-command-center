@@ -642,18 +642,90 @@ GO
 -- Replica drift as alerts, from the latest AG Sync run of each AG (agsync.DriftFinding):
 --   MissingOnSecondary : a login or job on the primary is missing or different on a secondary, and was not
 --                        fixed automatically (elevated, needs approval, or failed). Breaks apps after a failover.
---   OnlyOnSecondary    : a login or job exists on a secondary but not on the primary (e.g. added directly on a
---                        reporting replica). Never copied or removed automatically: a person confirms who owns it.
+--   OnlyOnSecondary    : a login or job currently exists on a secondary but not on the primary (e.g. added on a
+--                        reporting replica, or dropped on the primary). Never copied or removed automatically: a
+--                        person confirms who owns it, or records it as an approved exception (aghealth.DriftException).
 -- Both resolve when the next AG Sync run no longer finds them.
 INSERT aghealth.AlertRule (RuleName, Scope, Metric, Operator, ExpectedValue, Severity, AppliesTo, ConsecutiveSnapshots, Description, Runbook)
 SELECT v.RuleName, 'Replica', 'DriftState', '<>', 'In sync', v.Sev, 'All', 1, v.Descr, v.Runbook
 FROM (VALUES
     ('MissingOnSecondary', 'Warning', N'A login or Agent job on the primary is missing or different on this secondary: applications that need it break if this replica becomes PRIMARY',
      N'Fixed automatically when the policy allows. Otherwise Evidence says why it waits (an elevated login, a SID that differs): confirm with the owner, then run Invoke-AgSync -Mode Apply.'),
-    ('OnlyOnSecondary',    'Warning', N'A login or Agent job exists on this secondary but not on the primary: it was created here directly',
-     N'Find out who created it and why (reporting replicas attract these). Keep it if it belongs only here, create it on the primary if every replica needs it, or remove it.')
+    ('OnlyOnSecondary',    'Warning', N'A login or Agent job currently exists on this secondary but not on the primary',
+     N'Find out who owns it and why it is only here (reporting replicas attract these; it may also have been dropped on the primary). Keep it as an approved exception (aghealth.usp_ApproveDriftException), create it on the primary if every replica needs it, or remove it.')
 ) v(RuleName, Sev, Descr, Runbook)
 WHERE NOT EXISTS (SELECT 1 FROM aghealth.AlertRule r WHERE r.RuleName = v.RuleName);
+
+-- First wording claimed the object was "created here directly", which the history cannot prove
+UPDATE aghealth.AlertRule
+SET Description = N'A login or Agent job currently exists on this secondary but not on the primary',
+    Runbook = N'Find out who owns it and why it is only here (reporting replicas attract these; it may also have been dropped on the primary). Keep it as an approved exception (aghealth.usp_ApproveDriftException), create it on the primary if every replica needs it, or remove it.'
+WHERE RuleName = 'OnlyOnSecondary' AND Description LIKE N'%created here directly%';
+UPDATE aghealth.AlertRule
+SET Runbook = N'Fixed automatically when the policy allows. Otherwise Evidence says why it waits (an elevated login, an Agent job, a SID that differs): confirm with the owner, then approve that object with agsync.usp_ApproveSync; the next run applies it, and only it.'
+WHERE RuleName = 'MissingOnSecondary' AND Runbook LIKE N'%then run Invoke-AgSync -Mode Apply.';
+GO
+
+-- Approved exceptions: an object that is meant to exist only on one secondary (e.g. a reporting login).
+-- While approved and unexpired, its OnlyOnSecondary alert stays closed and the dashboard shows it as intentional.
+-- It is tied to the primary at the time of approval: after a failover the roles have changed, so the exception
+-- is put on hold and the alert comes back until someone re-approves it.
+IF OBJECT_ID('aghealth.DriftException') IS NULL
+CREATE TABLE aghealth.DriftException (
+    ExceptionId       int IDENTITY CONSTRAINT PK_DriftException PRIMARY KEY,
+    AgName            sysname        NOT NULL,
+    ReplicaServerName sysname        NOT NULL,
+    ObjectType        varchar(30)    NOT NULL,       -- Login | AgentJob
+    ObjectName        sysname        NOT NULL,
+    Justification     nvarchar(400)  NOT NULL,
+    ApprovedBy        nvarchar(128)  NOT NULL,
+    ApprovedAt        datetime2(0)   NOT NULL CONSTRAINT DF_DriftException_At DEFAULT SYSUTCDATETIME(),
+    ExpiresAt         datetime2(0)   NOT NULL,
+    PrimaryAtApproval sysname        NULL,
+    RevokedAt         datetime2(0)   NULL,
+    RevokedBy         nvarchar(128)  NULL);
+GO
+
+CREATE OR ALTER PROCEDURE aghealth.usp_ApproveDriftException
+    @AgName        sysname,
+    @Replica       sysname,
+    @ObjectType    varchar(30) = 'Login',
+    @ObjectName    sysname,
+    @Justification nvarchar(400),
+    @ApprovedBy    nvarchar(128),
+    @ReviewDays    int = 90
+AS
+BEGIN
+    SET NOCOUNT, XACT_ABORT ON;
+    IF @ObjectType NOT IN ('Login', 'AgentJob') THROW 50031, 'ObjectType must be Login or AgentJob.', 1;
+    IF NULLIF(LTRIM(@Justification), N'') IS NULL OR NULLIF(LTRIM(@ApprovedBy), N'') IS NULL
+        THROW 50032, 'Give the business justification and who approves it.', 1;
+    IF @ReviewDays NOT BETWEEN 1 AND 365 THROW 50033, 'Review period must be 1 to 365 days.', 1;
+    DECLARE @Primary sysname = (SELECT TOP (1) PrimaryReplica FROM aghealth.Snapshot
+                                WHERE AgName = @AgName AND Status = 'Succeeded' ORDER BY SnapshotId DESC);
+    IF @Primary IS NULL THROW 50034, 'No successful snapshot of this AG: cannot tell which replica is primary.', 1;
+    IF @Replica = @Primary THROW 50035, 'That replica is the primary: an exception is for an object that exists only on a secondary.', 1;
+    BEGIN TRAN;
+    UPDATE aghealth.DriftException SET RevokedAt = SYSUTCDATETIME(), RevokedBy = @ApprovedBy
+    WHERE AgName = @AgName AND ReplicaServerName = @Replica AND ObjectType = @ObjectType AND ObjectName = @ObjectName
+      AND RevokedAt IS NULL;
+    INSERT aghealth.DriftException (AgName, ReplicaServerName, ObjectType, ObjectName, Justification, ApprovedBy, ExpiresAt, PrimaryAtApproval)
+    OUTPUT inserted.ExceptionId, inserted.ObjectType, inserted.ObjectName, inserted.ReplicaServerName, inserted.ExpiresAt, inserted.PrimaryAtApproval
+    VALUES (@AgName, @Replica, @ObjectType, @ObjectName, @Justification, @ApprovedBy, DATEADD(DAY, @ReviewDays, SYSUTCDATETIME()), @Primary);
+    COMMIT;
+END;
+GO
+
+CREATE OR ALTER PROCEDURE aghealth.usp_RevokeDriftException
+    @ExceptionId int,
+    @RevokedBy   nvarchar(128)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    UPDATE aghealth.DriftException SET RevokedAt = SYSUTCDATETIME(), RevokedBy = @RevokedBy
+    WHERE ExceptionId = @ExceptionId AND RevokedAt IS NULL;
+    IF @@ROWCOUNT = 0 THROW 50036, 'No active exception with that id.', 1;
+END;
 GO
 
 CREATE OR ALTER PROCEDURE aghealth.usp_DriftEvaluate
@@ -686,6 +758,22 @@ BEGIN
     WHERE (x.RuleId = @RMiss AND @MissOn = 1) OR (x.RuleId = @ROnly AND @OnlyOn = 1)
     GROUP BY x.RuleId, x.TargetReplica, x.ObjectName;
 
+    -- Approved exceptions: honoured while unexpired and while the primary is the one they were approved under
+    CREATE TABLE #X (Replica sysname, ObjectName nvarchar(260), ExceptionId int, ApprovedBy nvarchar(128),
+                     ExpiresAt datetime2(0), Justification nvarchar(400), PrimaryAtApproval sysname NULL, OnHold bit);
+    INSERT #X
+    SELECT d.Replica, d.ObjectName, e.ExceptionId, e.ApprovedBy, e.ExpiresAt, e.Justification, e.PrimaryAtApproval,
+           CASE WHEN ISNULL(e.PrimaryAtApproval, N'') = ISNULL(@Primary, N'') THEN 0 ELSE 1 END
+    FROM #D d
+    CROSS APPLY (SELECT TOP (1) * FROM aghealth.DriftException e
+                 WHERE e.AgName = @AgName AND e.ReplicaServerName = d.Replica AND e.ObjectName = d.Name
+                   AND e.ObjectType = CASE d.Kind WHEN N'Agent job' THEN 'AgentJob' ELSE 'Login' END
+                   AND e.RevokedAt IS NULL AND e.ExpiresAt > @At
+                 ORDER BY e.ExceptionId DESC) e
+    WHERE d.RuleId = @ROnly;
+    DELETE d FROM #D d JOIN #X x ON x.Replica = d.Replica AND x.ObjectName = d.ObjectName AND x.OnHold = 0
+    WHERE d.RuleId = @ROnly;
+
     DECLARE @Changes TABLE (AlertId bigint, Change varchar(12));
     BEGIN TRAN;
     UPDATE a SET LastSeenAt = @At, LastSnapshotId = @SnapshotId,
@@ -717,22 +805,37 @@ BEGIN
         (1, N'What', CONCAT(d.Kind, N' ', d.Name)),
         (2, N'Replica', d.Replica),
         (3, N'Primary', @Primary),
-        (4, N'Found', CASE WHEN d.RuleId = @ROnly THEN N'Only on this secondary: created here directly, never on the primary'
+        (4, N'Found', CASE WHEN d.RuleId = @ROnly THEN N'Currently exists only on this secondary, not on the primary'
                            WHEN d.DriftType = 'Different' THEN N'Different from the primary'
                            ELSE N'Missing on this secondary' END),
         (5, N'Why it matters', CASE WHEN d.RuleId = @ROnly THEN N'Not part of failover: if it matters to an application, that application breaks when another replica becomes PRIMARY; if it should not exist, it is an unmanaged account'
                                     ELSE N'Applications that use it break if this replica becomes PRIMARY' END),
         (6, N'AG Sync', CONCAT(d.Action, CASE WHEN NULLIF(d.Detail, N'') IS NOT NULL THEN N': ' + d.Detail END)),
-        (7, N'Checked', CONCAT(FORMAT(@RunAt, 'yyyy-MM-dd HH:mm'), N' UTC, AG Sync run ', @RunId, N' (', @Mode, N')'))
+        (7, N'Checked', CONCAT(FORMAT(@RunAt, 'yyyy-MM-dd HH:mm'), N' UTC, AG Sync run ', @RunId, N' (', @Mode, N')')),
+        (8, N'Exception', (SELECT TOP (1) CONCAT(N'Exception ', x.ExceptionId, N' by ', x.ApprovedBy, N' is on hold: approved while ',
+                                                 ISNULL(x.PrimaryAtApproval, N'?'), N' was primary, and the primary is now ', @Primary,
+                                                 N'. Re-approve it if it still belongs only here.')
+                           FROM #X x WHERE x.Replica = d.Replica AND x.ObjectName = d.ObjectName AND x.OnHold = 1))
     ) v(SortOrder, Label, Value)
     WHERE c.Change = 'Opened' AND v.Value IS NOT NULL;
 
     -- Measured: the latest run no longer finds it
     UPDATE a SET State = 'Resolved', ResolvedAt = @At, LastSnapshotId = @SnapshotId, ResolvedBy = N'measured', LastValue = 'In sync',
-                 ResolutionNote = CASE WHEN a.RuleId = @ROnly THEN N'Measured: no longer only on the secondary (created on the primary, or removed).'
-                                       ELSE N'Measured: now in sync with the primary.' END
+                 ResolutionNote = LEFT(CASE
+                     WHEN a.RuleId = @ROnly AND x.ExceptionId IS NOT NULL
+                          THEN CONCAT(N'Approved exception ', x.ExceptionId, N' by ', x.ApprovedBy, N', review by ',
+                                      FORMAT(x.ExpiresAt, 'yyyy-MM-dd'), N': ', x.Justification)
+                     WHEN a.RuleId = @ROnly THEN N'Measured: no longer only on the secondary (created on the primary, or removed).'
+                     ELSE CONCAT(N'Measured: now in sync with the primary.',
+                                 (SELECT TOP (1) CONCAT(N' Approved by ', ap.ApprovedBy, N' (approval ', ap.ApprovalId, N'): ', ap.Reason)
+                                  FROM agsync.Approval ap
+                                  WHERE ap.AgName = @AgName AND ap.TargetReplica = a.ReplicaServerName AND ap.Outcome = 'Applied'
+                                    AND CONCAT(CASE ap.ObjectType WHEN 'AgentJob' THEN N'Agent job ' ELSE N'Login ' END, ap.ObjectName) = a.ObjectName
+                                    AND ap.UsedAt >= a.FirstSeenAt
+                                  ORDER BY ap.ApprovalId DESC)) END, 400)
     OUTPUT inserted.AlertId, 'Resolved' INTO @Changes
     FROM aghealth.Alert a
+    LEFT JOIN #X x ON a.RuleId = @ROnly AND x.Replica = a.ReplicaServerName AND x.ObjectName = a.ObjectName AND x.OnHold = 0
     WHERE a.State = 'Open' AND a.AgName = @AgName AND a.RuleId IN (@RMiss, @ROnly) AND a.DatabaseName = ''
       AND NOT EXISTS (SELECT 1 FROM #D d WHERE d.RuleId = a.RuleId AND d.Replica = a.ReplicaServerName AND d.ObjectName = a.ObjectName);
     COMMIT;
@@ -765,6 +868,8 @@ GRANT EXECUTE ON aghealth.usp_CompleteNotification TO aghealth_writer;
 GRANT EXECUTE ON aghealth.usp_ResolveAlert         TO aghealth_writer;
 GRANT EXECUTE ON aghealth.usp_RecordDecision       TO aghealth_writer;
 GRANT EXECUTE ON aghealth.usp_DriftEvaluate        TO aghealth_writer;
+GRANT EXECUTE ON aghealth.usp_ApproveDriftException TO aghealth_writer;
+GRANT EXECUTE ON aghealth.usp_RevokeDriftException  TO aghealth_writer;
 GRANT SELECT ON SCHEMA::aghealth TO aghealth_reader;
 
 -- The control account already used by AG Sync becomes the collector's writer

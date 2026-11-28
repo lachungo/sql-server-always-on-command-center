@@ -312,7 +312,18 @@ IF OBJECT_ID('agsync.SyncRun') IS NOT NULL
     LEFT JOIN agsync.DriftFinding f ON f.RunId = r.RunId;
 ELSE
     SELECT CAST(NULL AS sysname) AS AgName WHERE 1 = 0;
--- 11 how many objects Object Guard watches
+-- 11 approved drift exceptions (secondary-only objects that are meant to be there)
+IF OBJECT_ID('aghealth.DriftException') IS NOT NULL
+    SELECT e.AgName, e.ExceptionId, e.ReplicaServerName, e.ObjectType, e.ObjectName, e.Justification, e.ApprovedBy,
+           e.ApprovedAt, e.ExpiresAt, e.PrimaryAtApproval,
+           CONVERT(bit, CASE WHEN ISNULL(e.PrimaryAtApproval, N'') <> ISNULL(l.PrimaryReplica, N'') THEN 1 ELSE 0 END) AS OnHold
+    FROM aghealth.DriftException e
+    OUTER APPLY (SELECT TOP (1) s.PrimaryReplica FROM aghealth.Snapshot s
+                 WHERE s.AgName = e.AgName AND s.Status = 'Succeeded' ORDER BY s.SnapshotId DESC) l
+    WHERE e.RevokedAt IS NULL AND e.ExpiresAt > SYSUTCDATETIME();
+ELSE
+    SELECT CAST(NULL AS sysname) AS AgName WHERE 1 = 0;
+-- 12 how many objects Object Guard watches
 IF OBJECT_ID('aghealth.ObjectInventory') IS NOT NULL
     SELECT AgName, COUNT(*) AS Objects, COUNT(DISTINCT DatabaseName) AS Databases,
            SUM(CASE WHEN ObjectType = 'USER_TABLE' THEN 1 ELSE 0 END) AS Tables
@@ -1021,7 +1032,7 @@ function Export-AgDashboardData {
     $ds = Invoke-DbaQuery @control -EnableException -As DataSet -Query $script:DashboardQuery -SqlParameter @{ trend = $TrendMinutes }
     # One slot per result set, by position. Assigned one by one, so an empty result set stays an empty
     # slot instead of disappearing (which would shift every later section into the wrong place).
-    $t = [object[]]::new([Math]::Max(12, $ds.Tables.Count))
+    $t = [object[]]::new([Math]::Max(13, $ds.Tables.Count))
     for ($i = 0; $i -lt $t.Count; $i++) {
         $t[$i] = if ($i -lt $ds.Tables.Count) { @(ConvertTo-AgDashboardRow $ds.Tables[$i]) } else { @() }
     }
@@ -1051,10 +1062,11 @@ function Export-AgDashboardData {
             strip       = @(& $pick 4 $name)
             alerts      = $alerts
             resolved    = @(& $pick 8 $name | ForEach-Object { $_ | Add-Member -NotePropertyName Title -NotePropertyValue (Get-AgHealthTitle $_.RuleName) -PassThru })
-            guard       = [pscustomobject]@{ events = @(& $pick 9 $name); watched = @(& $pick 11 $name) | Select-Object -First 1 }
+            guard       = [pscustomobject]@{ events = @(& $pick 9 $name); watched = @(& $pick 12 $name) | Select-Object -First 1 }
             drift       = [pscustomobject]@{
                 run      = $drift | Select-Object -First 1 RunId, Mode, StartedAt
                 findings = @($drift | Where-Object { $_.ObjectName } | Select-Object ObjectType, ObjectName, SourceReplica, TargetReplica, DriftType, Detail, Action)
+                exceptions = @(& $pick 11 $name)
             }
         }
     }
